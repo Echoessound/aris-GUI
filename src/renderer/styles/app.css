@@ -237,6 +237,17 @@ body {
   border-radius: 8px 8px 0 0;
 }
 
+.settings-layout,
+.workflow-layout {
+  align-items: flex-start;
+}
+
+.git-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  gap: 10px;
+}
+
 .startup-diagnostics {
   margin-bottom: 14px;
 }
@@ -374,6 +385,16 @@ body {
     grid-template-columns: 1fr;
   }
 
+  .settings-layout,
+  .workflow-layout {
+    flex-direction: column;
+  }
+
+  .settings-layout > .panel,
+  .workflow-layout > .panel {
+    width: 100% !important;
+  }
+
   .toolbar {
     align-items: flex-start;
     flex-direction: column;
@@ -391,6 +412,10 @@ body {
   }
 
   .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .git-summary {
     grid-template-columns: 1fr;
   }
 

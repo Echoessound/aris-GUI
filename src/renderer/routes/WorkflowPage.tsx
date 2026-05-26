@@ -1,7 +1,7 @@
 import { Button, Form, Input, message, Popconfirm, Select, Space, Switch, Typography } from "antd";
 import { DeleteOutlined, UndoOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useState } from "react";
-import ReactFlow, { Background, Controls, type Node, addEdge, useEdgesState, useNodesState, type Connection } from "reactflow";
+import ReactFlow, { Background, Controls, MiniMap, type Node, addEdge, useEdgesState, useNodesState, type Connection } from "reactflow";
 import type { WorkflowTemplateDetail } from "../../shared/types";
 import { api } from "../api/electronApi";
 import { useProjectStore } from "../stores/projectStore";
@@ -34,7 +34,15 @@ export function WorkflowPage() {
       next.nodes.map((node) => ({
         id: node.id,
         position: { x: node.positionX, y: node.positionY },
-        data: { label: `${node.enabled ? "" : "[停用] "}${node.name}` }
+        data: { label: `${node.enabled ? "" : "[停用] "}${node.name}` },
+        style: {
+          border: node.enabled ? "1px solid #8fb2ff" : "1px dashed #c9d3e3",
+          background: node.enabled ? "#ffffff" : "#f8fafc",
+          color: node.enabled ? "#182235" : "#667085",
+          borderRadius: 8,
+          padding: 10,
+          minWidth: 160
+        }
       }))
     );
     setEdges(next.edges.map((edge) => ({ id: edge.id, source: edge.sourceNodeId, target: edge.targetNodeId })));
@@ -156,6 +164,7 @@ export function WorkflowPage() {
             onNodeClick={(_, node) => setSelectedNode(node)}
             fitView
           >
+            <MiniMap pannable zoomable />
             <Background />
             <Controls />
           </ReactFlow>
