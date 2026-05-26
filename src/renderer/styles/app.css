@@ -81,6 +81,22 @@ body {
   padding: 16px;
 }
 
+.startup-diagnostics {
+  margin-bottom: 14px;
+}
+
+.diagnostic-output {
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  font-size: 12px;
+}
+
 .muted {
   color: #64748b;
 }

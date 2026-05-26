@@ -1,6 +1,6 @@
 import { BrowserWindow } from "electron";
 import { execa } from "execa";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { getDb, id, nowIso, parseJson } from "../db/database";
 import type { ExecuteEvent, Run, RunDetail, RunStep, StartRunInput, WorkflowType } from "../../shared/types";
@@ -463,8 +463,7 @@ function readEventsForRun(runId: string): ExecuteEvent[] {
   if (!step?.stdout_path) return [];
   const eventsPath = path.join(path.dirname(step.stdout_path), "events.jsonl");
   try {
-    return require("node:fs")
-      .readFileSync(eventsPath, "utf8")
+    return readFileSync(eventsPath, "utf8")
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line: string) => JSON.parse(line));

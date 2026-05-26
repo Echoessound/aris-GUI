@@ -2,6 +2,7 @@ import { Button, Form, Input, message, Modal } from "antd";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ProjectList } from "../components/ProjectList";
+import { StartupDiagnostics } from "../components/StartupDiagnostics";
 import { api } from "../api/electronApi";
 import { useProjectStore } from "../stores/projectStore";
 import type { Project } from "../../shared/types";
@@ -41,6 +42,7 @@ export function HomePage() {
 
   return (
     <>
+      <StartupDiagnostics />
       <ProjectList
         projects={projects}
         selectedId={selectedProjectId}

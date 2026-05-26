@@ -1,8 +1,19 @@
 import { execa } from "execa";
+import { existsSync, readdirSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { getDb, id, nowIso, parseJson } from "../db/database";
 import type { ArisDiagnostics, ExecutorConfig, ExecutorTestResult, SaveExecutorInput } from "../../shared/types";
 
 const BLOCKED_DEFAULT_MODELS = new Set(["", "auto", "default", "gpt-5.4"]);
+const ARIS_SKILL_NAMES = [
+  "idea-discovery",
+  "research-pipeline",
+  "experiment-bridge",
+  "auto-review-loop",
+  "paper-writing",
+  "research-wiki"
+];
 
 export function ensureDefaultExecutors() {
   const db = getDb();
@@ -115,34 +126,107 @@ export async function testExecutor(executorId: string): Promise<ExecutorTestResu
 }
 
 export async function diagnoseAris(): Promise<ArisDiagnostics> {
-  const release = await fetchLatestRelease().catch((error) => ({
-    error: error instanceof Error ? error.message : String(error)
-  }));
-  for (const candidate of ["aris", "aris.exe"]) {
+  const [release, arisCli, codexCli, claudeCli] = await Promise.all([
+    fetchLatestRelease().catch((error) => ({
+      error: error instanceof Error ? error.message : String(error)
+    })),
+    detectCommand(["aris", "aris.exe"]),
+    detectCommand(["codex", "codex.cmd", "codex.exe"]),
+    detectCommand(["claude", "claude.cmd", "claude.exe"])
+  ]);
+  const skills = detectArisSkills();
+  const releaseUrl = "html_url" in release ? release.html_url : undefined;
+  const releaseName = "name" in release ? release.name : undefined;
+  const releaseError = "error" in release ? release.error : undefined;
+
+  if (arisCli.found) {
+    return {
+      found: true,
+      executable: arisCli.executable,
+      versionOutput: arisCli.versionOutput,
+      codexFound: codexCli.found,
+      codexVersionOutput: codexCli.versionOutput,
+      claudeFound: claudeCli.found,
+      claudeVersionOutput: claudeCli.versionOutput,
+      skillsFound: skills.found,
+      skillLocations: skills.locations,
+      latestReleaseUrl: releaseUrl,
+      latestReleaseName: releaseName,
+      installHint: buildInstallHint(true, skills.found, codexCli.found, claudeCli.found),
+      error: releaseError
+    };
+  }
+
+  return {
+    found: false,
+    codexFound: codexCli.found,
+    codexVersionOutput: codexCli.versionOutput,
+    claudeFound: claudeCli.found,
+    claudeVersionOutput: claudeCli.versionOutput,
+    skillsFound: skills.found,
+    skillLocations: skills.locations,
+    latestReleaseUrl: releaseUrl,
+    latestReleaseName: releaseName,
+    installHint: buildInstallHint(false, skills.found, codexCli.found, claudeCli.found),
+    error: releaseError
+  };
+}
+
+async function detectCommand(candidates: string[]) {
+  for (const candidate of candidates) {
     try {
       const result = await execa(candidate, ["--version"], { timeout: 10000, reject: false });
       if (result.exitCode === 0 || result.stdout || result.stderr) {
         return {
           found: true,
           executable: candidate,
-          versionOutput: [result.stdout, result.stderr].filter(Boolean).join("\n"),
-          latestReleaseUrl: "html_url" in release ? release.html_url : undefined,
-          latestReleaseName: "name" in release ? release.name : undefined,
-          installHint: "已在 PATH 中找到 ARIS，可直接配置为 ARIS-Code CLI 执行器。"
+          versionOutput: [result.stdout, result.stderr].filter(Boolean).join("\n")
         };
       }
     } catch {
       // Try next candidate.
     }
   }
-  return {
-    found: false,
-    latestReleaseUrl: "html_url" in release ? release.html_url : undefined,
-    latestReleaseName: "name" in release ? release.name : undefined,
-    installHint:
-      "未在 PATH 中找到 aris/aris.exe。请从官方 latest release 下载 Windows CLI，或 clone 官方仓库后运行 Windows 安装脚本，再回到本页重新诊断。",
-    error: "error" in release ? release.error : undefined
-  };
+  return { found: false };
+}
+
+function detectArisSkills() {
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, ".codex", "skills"),
+    path.join(home, ".claude", "skills"),
+    path.join(process.cwd(), ".agents", "skills"),
+    path.join(process.cwd(), ".claude", "skills")
+  ];
+  const locations = candidates.filter((root) => containsArisSkill(root));
+  return { found: locations.length > 0, locations };
+}
+
+function containsArisSkill(root: string) {
+  if (!existsSync(root)) return false;
+  try {
+    const entries = new Set(readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+    return ARIS_SKILL_NAMES.some((name) => entries.has(name));
+  } catch {
+    return false;
+  }
+}
+
+function buildInstallHint(arisFound: boolean, skillsFound: boolean, codexFound: boolean, claudeFound: boolean) {
+  const messages: string[] = [];
+  if (arisFound) {
+    messages.push("已在 PATH 中找到 ARIS CLI。");
+  } else {
+    messages.push("未在 PATH 中找到 aris/aris.exe，可从官方 release 安装 ARIS CLI。");
+  }
+  if (skillsFound) {
+    messages.push("已检测到 ARIS skills，Codex/Claude 可调用 ARIS workflow。");
+  } else {
+    messages.push("未检测到 ARIS skills，请运行 scripts/install-aris-skills.ps1。");
+  }
+  if (!codexFound) messages.push("未检测到 Codex CLI，如需使用默认执行器请先安装 codex。");
+  if (!claudeFound) messages.push("未检测到 Claude Code；如果只使用 Codex 或 ARIS CLI 可以忽略。");
+  return messages.join(" ");
 }
 
 async function fetchLatestRelease(): Promise<{ html_url?: string; name?: string }> {

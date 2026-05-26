@@ -250,6 +250,12 @@ export interface ArisDiagnostics {
   found: boolean;
   executable?: string;
   versionOutput?: string;
+  codexFound?: boolean;
+  codexVersionOutput?: string;
+  claudeFound?: boolean;
+  claudeVersionOutput?: string;
+  skillsFound?: boolean;
+  skillLocations?: string[];
   latestReleaseUrl?: string;
   latestReleaseName?: string;
   installHint: string;

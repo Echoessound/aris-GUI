@@ -1,6 +1,6 @@
 import { Button, Form, Input, message, Select, Space, Switch, Typography } from "antd";
 import { useEffect, useMemo, useState } from "react";
-import ReactFlow, { Background, Controls, type Edge, type Node, addEdge, useEdgesState, useNodesState, type Connection } from "reactflow";
+import ReactFlow, { Background, Controls, type Node, addEdge, useEdgesState, useNodesState, type Connection } from "reactflow";
 import type { WorkflowTemplateDetail } from "../../shared/types";
 import { api } from "../api/electronApi";
 import { useProjectStore } from "../stores/projectStore";
