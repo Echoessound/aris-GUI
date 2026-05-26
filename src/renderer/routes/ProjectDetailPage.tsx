@@ -37,6 +37,7 @@ export function ProjectDetailPage() {
   const [events, setEvents] = useState<ExecuteEvent[]>([]);
   const [insights, setInsights] = useState<RunInsight[]>([]);
   const [runningId, setRunningId] = useState<string>();
+  const [selectedRunId, setSelectedRunId] = useState<string>();
   const activeRunIdRef = useRef<string | undefined>(undefined);
   const [form] = Form.useForm();
   const codexExecutor = store.executors.find((executor) => executor.id === "executor-codex") ?? store.executors[0];
@@ -140,6 +141,7 @@ export function ProjectDetailPage() {
         topic: values.topic
       });
       setRunningId(run.id);
+      setSelectedRunId(run.id);
       activeRunIdRef.current = run.id;
       const detail = await api.runs.get(run.id);
       setEvents(detail.events);
@@ -242,18 +244,44 @@ export function ProjectDetailPage() {
             label: "运行",
             children: (
               <div className="panel">
-                <RunTimeline
-                  runs={store.runs}
-                  onOpen={async (run: Run) => {
-                    activeRunIdRef.current = run.status === "running" ? run.id : undefined;
-                    setRunningId(run.status === "running" ? run.id : undefined);
-                    const detail = await api.runs.get(run.id);
-                    setEvents(detail.events);
-                    setInsights(detail.insights);
-                  }}
+                <ReadinessChecklist
+                  repositoryReady={Boolean(activeProject.repositoryId)}
+                  executorReady={Boolean(codexExecutor)}
+                  workflowReady={Boolean(defaultWorkflow)}
+                  topicReady={Boolean(activeProject.topic?.trim())}
                 />
-                <RunInsightPanel insights={insights} />
-                <LogViewer events={events} />
+                <div className="run-workbench">
+                  <div className="run-list-pane">
+                    <div className="pane-heading">
+                      <Typography.Text strong>运行历史</Typography.Text>
+                      {selectedRunId && <Typography.Text className="muted mono">{selectedRunId.slice(0, 18)}...</Typography.Text>}
+                    </div>
+                    <RunTimeline
+                      runs={store.runs}
+                      selectedRunId={selectedRunId}
+                      onOpen={async (run: Run) => {
+                        setSelectedRunId(run.id);
+                        activeRunIdRef.current = run.status === "running" ? run.id : undefined;
+                        setRunningId(run.status === "running" ? run.id : undefined);
+                        const detail = await api.runs.get(run.id);
+                        setEvents(detail.events);
+                        setInsights(detail.insights);
+                      }}
+                    />
+                  </div>
+                  <div className="run-detail-pane">
+                    <div className="pane-heading">
+                      <Typography.Text strong>运行要点</Typography.Text>
+                      <Typography.Text className="muted">按真实进展实时追加</Typography.Text>
+                    </div>
+                    <RunInsightPanel insights={insights} />
+                    <div className="pane-heading">
+                      <Typography.Text strong>原始日志</Typography.Text>
+                      <Typography.Text className="muted">{events.length} 条事件</Typography.Text>
+                    </div>
+                    <LogViewer events={events} />
+                  </div>
+                </div>
               </div>
             )
           },
@@ -262,13 +290,14 @@ export function ProjectDetailPage() {
             label: "产物预览",
             children: (
               <div className="panel">
-                <Button onClick={async () => {
-                  await api.artifacts.rescan(activeProject.id);
-                  await store.refreshSelected();
-                }}>
-                  扫描产物
-                </Button>
-                <ArtifactPreview artifacts={store.artifacts} runs={store.runs} />
+                <ArtifactPreview
+                  artifacts={store.artifacts}
+                  runs={store.runs}
+                  onRescan={async () => {
+                    await api.artifacts.rescan(activeProject.id);
+                    await store.refreshSelected();
+                  }}
+                />
               </div>
             )
           },
@@ -301,6 +330,37 @@ function StatusTile({ label, value, mono }: { label: string; value: string; mono
     <div className="status-tile">
       <span className="status-label">{label}</span>
       <span className={`status-value${mono ? " mono" : ""}`} title={value}>{value}</span>
+    </div>
+  );
+}
+
+function ReadinessChecklist({
+  repositoryReady,
+  executorReady,
+  workflowReady,
+  topicReady
+}: {
+  repositoryReady: boolean;
+  executorReady: boolean;
+  workflowReady: boolean;
+  topicReady: boolean;
+}) {
+  const items = [
+    { label: "仓库", ready: repositoryReady },
+    { label: "执行器", ready: executorReady },
+    { label: "Workflow", ready: workflowReady },
+    { label: "研究主题", ready: topicReady }
+  ];
+  return (
+    <div className="readiness-bar">
+      <Typography.Text strong>启动准备</Typography.Text>
+      <Space wrap>
+        {items.map((item) => (
+          <Tag key={item.label} color={item.ready ? "green" : "orange"}>
+            {item.label}: {item.ready ? "就绪" : "待配置"}
+          </Tag>
+        ))}
+      </Space>
     </div>
   );
 }

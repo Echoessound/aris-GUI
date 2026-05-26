@@ -1,14 +1,14 @@
 import { Button, List, Space, Tag, Typography } from "antd";
 import type { Run } from "../../shared/types";
 
-export function RunTimeline({ runs, onOpen }: { runs: Run[]; onOpen(run: Run): void }) {
+export function RunTimeline({ runs, selectedRunId, onOpen }: { runs: Run[]; selectedRunId?: string; onOpen(run: Run): void }) {
   return (
     <List
       size="small"
       dataSource={runs}
       locale={{ emptyText: "暂无运行记录" }}
       renderItem={(run) => (
-        <List.Item actions={[<Button size="small" onClick={() => onOpen(run)} key="open">查看</Button>]}>
+        <List.Item className={run.id === selectedRunId ? "run-list-item-selected" : ""} actions={[<Button size="small" onClick={() => onOpen(run)} key="open">查看</Button>]}>
           <Space direction="vertical" size={2}>
             <Space wrap>
               <Typography.Text className="mono">{run.id}</Typography.Text>

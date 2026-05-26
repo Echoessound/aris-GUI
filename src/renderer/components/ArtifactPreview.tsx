@@ -1,13 +1,15 @@
-import { Empty, List, Space, Tabs, Tag, Typography } from "antd";
+import { Button, Empty, List, Space, Tabs, Tag, Typography, message } from "antd";
+import { FolderOpenOutlined, ReloadOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useEffect, useMemo, useState } from "react";
 import type { Artifact, Run } from "../../shared/types";
 import { api } from "../api/electronApi";
 
-export function ArtifactPreview({ artifacts, runs }: { artifacts: Artifact[]; runs: Run[] }) {
+export function ArtifactPreview({ artifacts, runs, onRescan }: { artifacts: Artifact[]; runs: Run[]; onRescan?: () => Promise<void> }) {
   const [selected, setSelected] = useState<Artifact | undefined>(artifacts[0]);
   const [activeRunKey, setActiveRunKey] = useState<string>();
+  const [activeType, setActiveType] = useState<string>("all");
   const [content, setContent] = useState("");
   const [url, setUrl] = useState("");
   const runLabelById = useMemo(() => new Map(runs.map((run) => [run.id, `第 ${run.roundIndex} 轮运行`])), [runs]);
@@ -45,9 +47,35 @@ export function ArtifactPreview({ artifacts, runs }: { artifacts: Artifact[]; ru
   }, [selected]);
 
   const activeArtifacts = groupedArtifacts.find((group) => group.key === activeRunKey)?.artifacts ?? [];
+  const activeTypes = useMemo(() => Array.from(new Set<string>(activeArtifacts.map((artifact) => artifact.type))), [activeArtifacts]);
+  const visibleArtifacts = activeType === "all" ? activeArtifacts : activeArtifacts.filter((artifact) => artifact.type === activeType);
+
+  useEffect(() => {
+    setActiveType((current) => current === "all" || activeTypes.includes(current) ? current : "all");
+  }, [activeTypes]);
 
   return (
     <Space direction="vertical" style={{ width: "100%", marginTop: 12 }}>
+      <div className="toolbar">
+        <Space wrap>
+          <Typography.Text strong>产物浏览</Typography.Text>
+          {selected && <Typography.Text className="mono muted" ellipsis style={{ maxWidth: 520 }}>{selected.path}</Typography.Text>}
+        </Space>
+        <div className="toolbar-actions">
+          <Button icon={<ReloadOutlined />} onClick={() => onRescan?.()}>重新扫描</Button>
+          <Button
+            icon={<FolderOpenOutlined />}
+            disabled={!selected}
+            onClick={async () => {
+              if (!selected) return;
+              const error = await api.shell.openPath(selected.path);
+              if (error) message.error(error);
+            }}
+          >
+            打开文件
+          </Button>
+        </div>
+      </div>
       {groupedArtifacts.length === 0 ? (
         <Empty description="暂无产物" />
       ) : (
@@ -60,12 +88,25 @@ export function ArtifactPreview({ artifacts, runs }: { artifacts: Artifact[]; ru
           }))}
         />
       )}
+      {activeTypes.length > 0 && (
+        <Tabs
+          activeKey={activeType}
+          onChange={setActiveType}
+          items={[
+            { key: "all", label: `全部 (${activeArtifacts.length})` },
+            ...activeTypes.map((type) => ({
+              key: type,
+              label: `${type} (${activeArtifacts.filter((artifact) => artifact.type === type).length})`
+            }))
+          ]}
+        />
+      )}
       <Space align="start" style={{ width: "100%" }} wrap>
         <div className="artifact-run-list">
-          {activeArtifacts.length === 0 ? <Empty description="该轮暂无产物" /> : (
+          {visibleArtifacts.length === 0 ? <Empty description="该分类暂无产物" /> : (
             <List
               size="small"
-              dataSource={activeArtifacts}
+              dataSource={visibleArtifacts}
               renderItem={(artifact) => (
                 <List.Item onClick={() => setSelected(artifact)} style={{ cursor: "pointer" }}>
                   <Space direction="vertical" size={2} style={{ width: "100%" }}>
