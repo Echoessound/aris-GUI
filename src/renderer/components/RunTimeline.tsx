@@ -10,7 +10,7 @@ export function RunTimeline({ runs, onOpen }: { runs: Run[]; onOpen(run: Run): v
       renderItem={(run) => (
         <List.Item actions={[<Button size="small" onClick={() => onOpen(run)} key="open">查看</Button>]}>
           <Space direction="vertical" size={2}>
-            <Space>
+            <Space wrap>
               <Typography.Text className="mono">{run.id}</Typography.Text>
               <Tag color={run.status === "failed" ? "red" : run.status === "running" ? "blue" : "green"}>{run.status}</Tag>
             </Space>

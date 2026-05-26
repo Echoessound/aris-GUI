@@ -14,9 +14,15 @@ export type WorkflowType =
   | "experiment-bridge"
   | "auto-review-loop"
   | "paper-writing"
+  | "multi-agent-paper-review"
   | "custom";
 export type RunStatus = "pending" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
-export type ArtifactType = "markdown" | "pdf" | "json" | "jsonl" | "image" | "latex" | "text" | "log" | "other";
+export type RunInsightStatus = "pending" | "running" | "completed" | "blocked" | "failed";
+export type ArtifactType = "markdown" | "pdf" | "word" | "json" | "jsonl" | "image" | "latex" | "text" | "log" | "other";
+export type CodexChatMode = "ask" | "edit";
+export type CodexChatRole = "user" | "assistant" | "system";
+export type CodexEditStatus = "none" | "preview" | "applied" | "failed";
+export type CodexChatStatus = "running" | "completed" | "failed";
 
 export interface Project {
   id: string;
@@ -138,10 +144,11 @@ export interface ExecuteRequest {
 export interface ExecuteEvent {
   runId: string;
   stepId?: string;
-  type: "start" | "stdout" | "stderr" | "exit" | "error";
+  type: "start" | "stdout" | "stderr" | "exit" | "error" | "insight";
   message: string;
   exitCode?: number;
   timestamp: string;
+  payload?: RunInsight;
 }
 
 export interface StartRunInput {
@@ -183,6 +190,56 @@ export interface RunStep {
 export interface RunDetail extends Run {
   steps: RunStep[];
   events: ExecuteEvent[];
+  insights: RunInsight[];
+}
+
+export interface RunInsight {
+  id: string;
+  runId: string;
+  stageKey: string;
+  title: string;
+  status: RunInsightStatus;
+  bullets: string[];
+  blockers: string[];
+  nextActions: string[];
+  agentName?: string | null;
+  timestamp: string;
+}
+
+export interface CodexChatMessage {
+  id: string;
+  projectId: string;
+  role: CodexChatRole;
+  mode: CodexChatMode;
+  content: string;
+  status: CodexChatStatus;
+  editStatus: CodexEditStatus;
+  patchText?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+}
+
+export interface CodexChatEvent {
+  projectId: string;
+  messageId: string;
+  type: "started" | "stdout" | "stderr" | "completed" | "error";
+  delta?: string;
+  message?: string;
+  timestamp: string;
+  payload?: CodexChatMessage;
+}
+
+export interface CodexChatSendInput {
+  projectId: string;
+  message: string;
+  mode: CodexChatMode;
+}
+
+export interface CodexEditPreview {
+  messageId: string;
+  patchText: string;
+  summary: string;
+  status: CodexEditStatus;
 }
 
 export interface Artifact {
@@ -298,11 +355,22 @@ export interface ArisAppApi {
     listTemplates(): Promise<WorkflowTemplate[]>;
     getTemplate(id: string): Promise<WorkflowTemplateDetail>;
     saveTemplate(input: SaveWorkflowTemplateInput): Promise<WorkflowTemplateDetail>;
+    resetTemplate(id: string): Promise<WorkflowTemplateDetail>;
+  };
+  codexChat: {
+    list(projectId: string): Promise<CodexChatMessage[]>;
+    send(input: CodexChatSendInput): Promise<CodexChatMessage>;
+    previewEdit(messageId: string): Promise<CodexEditPreview>;
+    applyEdit(messageId: string): Promise<CodexChatMessage>;
+    onEvent(callback: (event: CodexChatEvent) => void): () => void;
   };
   executors: {
     list(): Promise<ExecutorConfig[]>;
     save(input: SaveExecutorInput): Promise<ExecutorConfig>;
     test(id: string): Promise<ExecutorTestResult>;
     diagnoseAris(): Promise<ArisDiagnostics>;
+  };
+  shell: {
+    openPath(path: string): Promise<string>;
   };
 }

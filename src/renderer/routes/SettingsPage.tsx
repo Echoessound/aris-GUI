@@ -6,11 +6,11 @@ import { useProjectStore } from "../stores/projectStore";
 
 const executorKinds: ExecutorKind[] = ["codex-cli", "aris-code", "claude-code", "custom"];
 const modelOptions = [
-  { value: "auto", label: "auto (use Codex CLI default)" },
+  { value: "auto", label: "auto（使用 Codex CLI 默认模型）" },
   { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
   { value: "gpt-5.3-codex", label: "gpt-5.3-codex" },
   { value: "gpt-5.2", label: "gpt-5.2" },
-  { value: "gpt-5.4", label: "gpt-5.4 (may be at capacity)" }
+  { value: "gpt-5.4", label: "gpt-5.4（可能容量紧张）" }
 ];
 const fallbackModelOptions = modelOptions.filter((option) => option.value !== "auto");
 
@@ -72,10 +72,10 @@ export function SettingsPage() {
   }
 
   return (
-    <Space align="start" style={{ width: "100%" }}>
+    <Space align="start" style={{ width: "100%" }} className="settings-layout">
       <div className="panel" style={{ width: 430 }}>
         <div className="toolbar">
-          <Typography.Title level={5}>执行器配置</Typography.Title>
+          <Typography.Title level={5} style={{ margin: 0 }}>执行器</Typography.Title>
           <Button
             onClick={() => {
               setEditing(undefined);
@@ -91,13 +91,13 @@ export function SettingsPage() {
           renderItem={(executor) => (
             <List.Item actions={[<Button size="small" onClick={() => setEditing(executor)} key="edit">编辑</Button>]}>
               <Space direction="vertical" size={2}>
-                <Space>
+                <Space wrap>
                   <Typography.Text strong>{executor.name}</Typography.Text>
                   <Tag color={executor.id === "executor-codex" ? "blue" : undefined}>{executor.kind}</Tag>
                   {executor.id === "executor-codex" && <Tag color="geekblue">默认</Tag>}
-                  {executor.enabled && <Tag color="green">启用</Tag>}
+                  {executor.enabled ? <Tag color="green">启用</Tag> : <Tag>停用</Tag>}
                 </Space>
-                <Typography.Text className="mono muted">{executor.executablePath} {executor.defaultArgs.join(" ")}</Typography.Text>
+                <Typography.Text className="mono muted" ellipsis style={{ maxWidth: 320 }}>{executor.executablePath} {executor.defaultArgs.join(" ")}</Typography.Text>
               </Space>
             </List.Item>
           )}
@@ -109,16 +109,18 @@ export function SettingsPage() {
             setDiagnostics(result);
           }}
         >
-          诊断 ARIS 安装
+          诊断 ARIS / Codex 环境
         </Button>
         {diagnostics && (
           <div style={{ marginTop: 12 }}>
             <Tag color={diagnostics.found ? "green" : "orange"}>{diagnostics.found ? "已找到 ARIS" : "未找到 ARIS"}</Tag>
+            {diagnostics.codexFound !== undefined && <Tag color={diagnostics.codexFound ? "green" : "orange"}>{diagnostics.codexFound ? "Codex 可用" : "Codex 未找到"}</Tag>}
+            {diagnostics.claudeFound !== undefined && <Tag color={diagnostics.claudeFound ? "green" : "default"}>{diagnostics.claudeFound ? "Claude 可用" : "Claude 未找到"}</Tag>}
             <Typography.Paragraph className="muted">{diagnostics.installHint}</Typography.Paragraph>
             {diagnostics.latestReleaseUrl && (
               <Typography.Link href={diagnostics.latestReleaseUrl}>官方 latest release：{diagnostics.latestReleaseName ?? diagnostics.latestReleaseUrl}</Typography.Link>
             )}
-            {diagnostics.versionOutput && <pre className="mono">{diagnostics.versionOutput}</pre>}
+            {diagnostics.versionOutput && <pre className="diagnostic-output mono">{diagnostics.versionOutput}</pre>}
             {diagnostics.error && <Typography.Text type="danger">{diagnostics.error}</Typography.Text>}
           </div>
         )}
@@ -126,8 +128,8 @@ export function SettingsPage() {
       <div className="panel" style={{ flex: 1 }}>
         <Typography.Title level={5}>{editing ? "编辑执行器" : "新建执行器"}</Typography.Title>
         <Form layout="vertical" form={form} initialValues={{ kind: "codex-cli", executablePath: "codex", enabled: true, envText: "{}" }}>
-          <Space style={{ width: "100%" }} align="start">
-            <Form.Item name="name" label="名称" rules={[{ required: true }]} style={{ flex: 1 }}>
+          <Space style={{ width: "100%" }} align="start" wrap>
+            <Form.Item name="name" label="名称" rules={[{ required: true }]} style={{ flex: 1, minWidth: 260 }}>
               <Input placeholder="Codex CLI" />
             </Form.Item>
             <Form.Item name="kind" label="类型" rules={[{ required: true }]} style={{ width: 180 }}>
@@ -141,46 +143,31 @@ export function SettingsPage() {
             <Input placeholder="codex / aris / claude / cmd.exe" />
           </Form.Item>
           <Form.Item name="defaultArgsText" label="默认参数">
-            <Input placeholder="例如：--version，或留空让启动 Workflow 时自动拼接" />
+            <Input placeholder="例如 --version，或留空让 Workflow 启动时自动拼接" />
           </Form.Item>
-          <Typography.Title level={5}>API 设置</Typography.Title>
-          <Space style={{ width: "100%" }} align="start">
-            <Form.Item name="apiKey" label="OPENAI_API_KEY" style={{ flex: 1 }}>
+          <Typography.Title level={5}>Codex API 设置</Typography.Title>
+          <Space style={{ width: "100%" }} align="start" wrap>
+            <Form.Item name="apiKey" label="OPENAI_API_KEY" style={{ flex: 1, minWidth: 260 }}>
               <Input.Password placeholder="sk-..." />
             </Form.Item>
-            <Form.Item name="baseUrl" label="OPENAI_BASE_URL" style={{ flex: 1 }}>
+            <Form.Item name="baseUrl" label="OPENAI_BASE_URL" style={{ flex: 1, minWidth: 260 }}>
               <Input placeholder="https://api.openai.com/v1" />
             </Form.Item>
             <Form.Item name="model" label="OPENAI_MODEL" style={{ width: 260 }}>
-              <Select
-                showSearch
-                options={modelOptions}
-                placeholder="auto"
-              />
+              <Select showSearch options={modelOptions} placeholder="auto" />
             </Form.Item>
           </Space>
           <Form.Item name="fallbackModels" label="OPENAI_FALLBACK_MODELS">
-            <Select
-              mode="tags"
-              tokenSeparators={[","]}
-              options={fallbackModelOptions}
-              placeholder="gpt-5.4-mini,gpt-5.3-codex,gpt-5.2"
-            />
+            <Select mode="tags" tokenSeparators={[","]} options={fallbackModelOptions} placeholder="gpt-5.4-mini,gpt-5.3-codex,gpt-5.2" />
           </Form.Item>
-          <Space style={{ width: "100%" }} align="start">
+          <Space style={{ width: "100%" }} align="start" wrap>
             <Form.Item name="approvalMode" label="CODEX_APPROVAL_MODE" style={{ width: 240 }}>
-              <Select
-                allowClear
-                options={[
-                  { value: "never", label: "never（配合 danger-full-access 使用 bypass）" },
-                  { value: "default", label: "default（不传 approval 参数）" }
-                ]}
-              />
+              <Select allowClear options={[{ value: "never", label: "never" }, { value: "default", label: "default" }]} />
             </Form.Item>
             <Form.Item name="sandboxMode" label="CODEX_SANDBOX_MODE" style={{ width: 260 }}>
               <Select allowClear options={["danger-full-access", "workspace-write", "read-only"].map((value) => ({ value, label: value }))} />
             </Form.Item>
-            <Form.Item name="workingDirectory" label="默认工作目录" style={{ flex: 1 }}>
+            <Form.Item name="workingDirectory" label="默认工作目录" style={{ flex: 1, minWidth: 260 }}>
               <Input />
             </Form.Item>
           </Space>

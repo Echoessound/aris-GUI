@@ -125,6 +125,19 @@ function migrate(database: Database.Database) {
       error_message TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS run_insights (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      stage_key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      bullets_json TEXT NOT NULL,
+      blockers_json TEXT NOT NULL,
+      next_actions_json TEXT NOT NULL,
+      agent_name TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS artifacts (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
@@ -150,7 +163,27 @@ function migrate(database: Database.Database) {
       summary_json TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS codex_chat_messages (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'completed',
+      patch_text TEXT,
+      edit_status TEXT NOT NULL DEFAULT 'none',
+      error_message TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
+  ensureColumn(database, "codex_chat_messages", "status", "TEXT NOT NULL DEFAULT 'completed'");
+}
+
+function ensureColumn(database: Database.Database, table: string, column: string, definition: string) {
+  const rows = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (rows.some((row) => row.name === column)) return;
+  database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 export function nowIso() {

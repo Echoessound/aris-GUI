@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { ArisAppApi, ExecuteEvent } from "../shared/types";
+import type { ArisAppApi, CodexChatEvent, ExecuteEvent } from "../shared/types";
 
 const api: ArisAppApi = {
   projects: {
@@ -40,13 +40,28 @@ const api: ArisAppApi = {
   workflows: {
     listTemplates: () => ipcRenderer.invoke("workflow:list"),
     getTemplate: (id) => ipcRenderer.invoke("workflow:get", id),
-    saveTemplate: (input) => ipcRenderer.invoke("workflow:save", input)
+    saveTemplate: (input) => ipcRenderer.invoke("workflow:save", input),
+    resetTemplate: (id) => ipcRenderer.invoke("workflow:reset", id)
+  },
+  codexChat: {
+    list: (projectId) => ipcRenderer.invoke("codex-chat:list", projectId),
+    send: (input) => ipcRenderer.invoke("codex-chat:send", input),
+    previewEdit: (messageId) => ipcRenderer.invoke("codex-chat:preview-edit", messageId),
+    applyEdit: (messageId) => ipcRenderer.invoke("codex-chat:apply-edit", messageId),
+    onEvent: (callback) => {
+      const handler = (_event: Electron.IpcRendererEvent, payload: CodexChatEvent) => callback(payload);
+      ipcRenderer.on("codex-chat:event", handler);
+      return () => ipcRenderer.off("codex-chat:event", handler);
+    }
   },
   executors: {
     list: () => ipcRenderer.invoke("executor:list"),
     save: (input) => ipcRenderer.invoke("executor:save", input),
     test: (id) => ipcRenderer.invoke("executor:test", id),
     diagnoseAris: () => ipcRenderer.invoke("executor:diagnose-aris")
+  },
+  shell: {
+    openPath: (path) => ipcRenderer.invoke("shell:open-path", path)
   }
 };
 

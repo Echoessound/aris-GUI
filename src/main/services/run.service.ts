@@ -1,26 +1,55 @@
 import { BrowserWindow } from "electron";
 import { execa } from "execa";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { getDb, id, nowIso, parseJson } from "../db/database";
-import type { ExecuteEvent, Run, RunDetail, RunStep, StartRunInput, WorkflowType } from "../../shared/types";
+import type { ExecuteEvent, Run, RunDetail, RunInsight, RunInsightStatus, RunStep, StartRunInput, WorkflowType } from "../../shared/types";
 import { getExecutor } from "./executor.service";
 import { rescanArtifacts } from "./artifact.service";
+import { appendUtf8Guidance, decodeTextBuffer, readTextFile, UTF8_PROCESS_ENV } from "./encoding.service";
 import { getProject } from "./project.service";
 import { readGitStatus } from "./repository.service";
+import { getWorkflowTemplate } from "./workflow.service";
 
 const running = new Map<string, ReturnType<typeof execa>>();
 const DEFAULT_FALLBACK_MODELS = ["gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"];
-const SOFT_IDLE_TIMEOUT_MS = 120000;
-const DEFAULT_HARD_IDLE_TIMEOUT_MS = 600000;
+const SOFT_IDLE_TIMEOUT_MS = 300000;
+const DEFAULT_HARD_IDLE_TIMEOUT_MS = 1800000;
 const MAX_EVENT_MESSAGE_CHARS = 8192;
+const QUALITY_BUDGETS: Record<string, { minMs: number; minMarkdownChars: number; label: string }> = {
+  "research-pipeline": { minMs: 10 * 60 * 1000, minMarkdownChars: 12000, label: "完整论文生成" },
+  "paper-writing": { minMs: 8 * 60 * 1000, minMarkdownChars: 8000, label: "论文写作" },
+  "multi-agent-paper-review": { minMs: 5 * 60 * 1000, minMarkdownChars: 4000, label: "多 Agent 论文评审" },
+  "auto-review-loop": { minMs: 5 * 60 * 1000, minMarkdownChars: 3000, label: "自动审稿" },
+  "idea-discovery": { minMs: 3 * 60 * 1000, minMarkdownChars: 2500, label: "立题发现" },
+  "experiment-bridge": { minMs: 3 * 60 * 1000, minMarkdownChars: 2500, label: "实验桥接" }
+};
 const CORE_ARTIFACTS = [
   path.join("idea-stage", "IDEA_REPORT.md"),
   "NARRATIVE_REPORT.md",
   "FINAL_REPORT.md",
   "PIPELINE_REPORT.md",
-  path.join("review-stage", "AUTO_REVIEW.md")
+  path.join("review-stage", "AUTO_REVIEW.md"),
+  path.join("review-stage", "MULTI_AGENT_REVIEW.md")
 ];
+
+interface ProgressInsightState {
+  cursor: number;
+  activeStageKey?: string;
+  seenStageKeys: Set<string>;
+}
+
+const STAGE_TITLES: Record<string, string> = {
+  "idea-discovery": "立题发现",
+  "auto-review-loop": "写作前评审",
+  "experiment-bridge": "实验桥接",
+  "paper-plan": "论文规划",
+  "paper-write": "论文写作",
+  "paper-compile": "论文编译",
+  "multi-agent-paper-review": "成稿后多 Agent 评审",
+  "artifact-summary": "成果摘要",
+  "run-complete": "运行收尾"
+};
 
 export function listRuns(projectId: string): Run[] {
   const rows = getDb().prepare("SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC").all(projectId) as any[];
@@ -32,7 +61,8 @@ export function getRun(runId: string): RunDetail {
   if (!run) throw new Error("运行记录不存在");
   const steps = getDb().prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY started_at ASC").all(runId) as any[];
   const events = readEventsForRun(runId);
-  return { ...mapRun(run), steps: steps.map(mapRunStep), events };
+  const insights = listRunInsights(runId);
+  return { ...mapRun(run), steps: steps.map(mapRunStep), events, insights };
 }
 
 export function cleanupInterruptedRuns() {
@@ -63,14 +93,17 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   const runId = id("run");
   const stepId = id("step");
   const startedAt = nowIso();
+  const runStartedAt = new Date(startedAt);
   const runDir = path.join(project.repository.path, ".aris-app", "runs", runId);
   mkdirSync(runDir, { recursive: true });
   const stdoutPath = path.join(runDir, "stdout.log");
   const stderrPath = path.join(runDir, "stderr.log");
   const eventsPath = path.join(runDir, "events.jsonl");
+  const progressPath = path.join(runDir, "progress.zh.jsonl");
   writeFileSync(stdoutPath, "", "utf8");
   writeFileSync(stderrPath, "", "utf8");
   writeFileSync(eventsPath, "", "utf8");
+  writeFileSync(progressPath, "", "utf8");
   writeResearchBrief(project.repository.path, workflowType, input.topic ?? project.topic, runId);
 
   const gitBefore = await readGitStatus(project.repository.path).catch((error) => ({ error: String(error) }));
@@ -92,6 +125,8 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   db.prepare("UPDATE projects SET status = 'running', run_count = run_count + 1, updated_at = ? WHERE id = ?").run(startedAt, project.id);
 
   emit(runDir, { runId, stepId, type: "start", message: [command, ...args].join(" "), timestamp: startedAt });
+  const progressState = createProgressInsightState();
+  emitInitialStage(runDir, runId, buildRunStages(project.defaultWorkflowId, workflowType), progressState, stepId, startedAt);
   if (executor.kind === "codex-cli") {
     emit(runDir, { runId, stepId, type: "stderr", message: `Codex model plan: ${describeModelPlan(commandPlan)}`, timestamp: nowIso() });
   }
@@ -101,7 +136,17 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   let lastOutputAt = Date.now();
   let softIdleWarningSent = false;
   let artifactWaitNoticeSent = false;
+  let artifactSummarySent = false;
+  const flushProgressInsights = () => {
+    emitProgressInsights(progressPath, runDir, runId, stepId, progressState);
+  };
+  const progressWatcher = watchProgressFile(progressPath, flushProgressInsights);
   const idleTimer = setInterval(() => {
+    flushProgressInsights();
+    if (!artifactSummarySent && hasCoreArtifact(project.repository!.path, runStartedAt)) {
+      artifactSummarySent = true;
+      emitArtifactSummary(project.repository!.path, runDir, runId, stepId, runStartedAt);
+    }
     const idleFor = Date.now() - lastOutputAt;
     if (idleFor >= SOFT_IDLE_TIMEOUT_MS && !softIdleWarningSent) {
       softIdleWarningSent = true;
@@ -109,12 +154,12 @@ export async function startRun(input: StartRunInput): Promise<Run> {
         runId,
         stepId,
         type: "stderr",
-        message: "Executor produced no output for 120 seconds; keeping it alive and waiting for progress.",
+        message: "Executor produced no output for 300 seconds; keeping it alive and waiting for progress.",
         timestamp: nowIso()
       });
     }
     if (idleFor < hardIdleTimeoutMs) return;
-    if (hasCoreArtifact(project.repository!.path)) {
+    if (hasCoreArtifact(project.repository!.path, runStartedAt)) {
       if (!artifactWaitNoticeSent) {
         artifactWaitNoticeSent = true;
         emit(runDir, {
@@ -142,13 +187,13 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   const attachStreams = (activeChild: ReturnType<typeof startChild>) => {
     activeChild.stdout?.on("data", (chunk: Buffer) => {
       lastOutputAt = Date.now();
-      const message = chunk.toString();
+      const message = decodeTextBuffer(chunk);
       appendFileSync(stdoutPath, message, "utf8");
       emit(runDir, { runId, stepId, type: "stdout", message: redact(message), timestamp: nowIso() });
     });
     activeChild.stderr?.on("data", (chunk: Buffer) => {
       lastOutputAt = Date.now();
-      const message = chunk.toString();
+      const message = decodeTextBuffer(chunk);
       appendFileSync(stderrPath, message, "utf8");
       emit(runDir, { runId, stepId, type: "stderr", message: redact(message), timestamp: nowIso() });
     });
@@ -170,15 +215,22 @@ export async function startRun(input: StartRunInput): Promise<Run> {
         result = await activeChild;
         attemptIndex += 1;
       }
+      flushProgressInsights();
       running.delete(runId);
+      progressWatcher.close();
       clearInterval(idleTimer);
       const endedAt = nowIso();
       const gitAfter = await readGitStatus(project.repository!.path).catch((error) => ({ error: String(error) }));
       writeFileSync(path.join(runDir, "git-after.json"), JSON.stringify(gitAfter, null, 2), "utf8");
       ensureFallbackArtifact(project.repository!.path, runId, workflowType, input.topic ?? project.topic, result.exitCode ?? null, result.stderr || result.stdout || "");
+      if (shouldRunMultiAgentPaperReview(workflowType)) {
+        await runMultiAgentPaperReview(project.repository!.path, runDir, runId, stepId, input.topic ?? project.topic);
+      }
       const artifacts = rescanArtifacts(project.id, runId);
-      const producedCoreArtifact = hasCoreArtifact(project.repository!.path);
+      const producedCoreArtifact = hasCoreArtifact(project.repository!.path, runStartedAt);
       const status = result.exitCode === 0 || producedCoreArtifact ? "completed" : "failed";
+      if (producedCoreArtifact) emitArtifactSummary(project.repository!.path, runDir, runId, stepId, runStartedAt);
+      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt));
       const errorMessage =
         result.exitCode === 0
           ? null
@@ -213,17 +265,55 @@ export async function startRun(input: StartRunInput): Promise<Run> {
         exitCode: result.exitCode,
         timestamp: endedAt
       });
+      emitInsight(runDir, {
+        runId,
+        stageKey: "run-complete",
+        title: "运行收尾",
+        status,
+        bullets: [status === "completed" ? "Workflow 已结束，并已扫描本地成果。" : "Workflow 已结束，但没有检测到核心成果。"],
+        blockers: status === "failed" && errorMessage ? [errorMessage] : [],
+        nextActions: status === "completed" ? ["打开成果预览查看 Markdown、PDF 和评审报告。"] : ["查看原始日志，修正执行器或环境问题后重试。"],
+        agentName: "ARIS Paper Studio",
+        timestamp: endedAt
+      }, stepId);
     })
     .catch((error) => {
       running.delete(runId);
+      progressWatcher.close();
       clearInterval(idleTimer);
       const endedAt = nowIso();
       const message = error instanceof Error ? error.message : String(error);
       ensureFallbackArtifact(project.repository!.path, runId, workflowType, input.topic ?? project.topic, null, message);
-      db.prepare("UPDATE run_steps SET status = 'failed', ended_at = ?, error_message = ? WHERE id = ?").run(endedAt, message, stepId);
-      db.prepare("UPDATE runs SET status = 'failed', ended_at = ?, error_message = ? WHERE id = ?").run(endedAt, message, runId);
-      db.prepare("UPDATE projects SET status = 'failed', updated_at = ? WHERE id = ?").run(endedAt, project.id);
-      emit(runDir, { runId, stepId, type: "error", message, timestamp: endedAt });
+      const artifacts = rescanArtifacts(project.id, runId);
+      const producedCoreArtifact = hasCoreArtifact(project.repository!.path, runStartedAt);
+      const status = producedCoreArtifact ? "completed" : "failed";
+      if (producedCoreArtifact) emitArtifactSummary(project.repository!.path, runDir, runId, stepId, runStartedAt);
+      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt));
+      const errorMessage = producedCoreArtifact
+        ? "Executor failed before normal exit, but a fallback artifact was produced."
+        : message;
+      db.prepare("UPDATE run_steps SET status = ?, ended_at = ?, error_message = ? WHERE id = ?").run(status, endedAt, errorMessage, stepId);
+      db.prepare("UPDATE runs SET status = ?, ended_at = ?, error_message = ? WHERE id = ?").run(status, endedAt, errorMessage, runId);
+      db.prepare("UPDATE projects SET status = ?, updated_at = ? WHERE id = ?").run(status, endedAt, project.id);
+      writeFileSync(path.join(runDir, "artifacts.json"), JSON.stringify(artifacts, null, 2), "utf8");
+      emit(runDir, {
+        runId,
+        stepId,
+        type: producedCoreArtifact ? "exit" : "error",
+        message: producedCoreArtifact ? "运行完成；执行器异常退出，但已生成可检查成果。" : message,
+        timestamp: endedAt
+      });
+      emitInsight(runDir, {
+        runId,
+        stageKey: "run-complete",
+        title: "运行收尾",
+        status,
+        bullets: [producedCoreArtifact ? "执行器异常退出，但已留下可检查的中文成果。" : "执行器异常退出，且没有检测到核心成果。"],
+        blockers: status === "failed" ? [message] : [],
+        nextActions: producedCoreArtifact ? ["打开成果预览继续检查输出质量。"] : ["查看日志定位执行器错误后重试。"],
+        agentName: "ARIS Paper Studio",
+        timestamp: endedAt
+      }, stepId);
     });
 
   return getRun(runId);
@@ -248,7 +338,7 @@ export async function stopRun(runId: string) {
 }
 
 function startChild(command: string, args: string[], cwd: string, env?: Record<string, string>, syncCodexModelEnv = false) {
-  const childEnv = { ...process.env, ...(env ?? {}) };
+  const childEnv = { ...process.env, ...UTF8_PROCESS_ENV, ...(env ?? {}) };
   if (syncCodexModelEnv) {
     const modelFlagIndex = args.indexOf("-m");
     if (modelFlagIndex >= 0 && args[modelFlagIndex + 1]) {
@@ -264,6 +354,128 @@ function startChild(command: string, args: string[], cwd: string, env?: Record<s
     reject: false,
     all: false
   });
+}
+
+function shouldRunMultiAgentPaperReview(workflowType: WorkflowType) {
+  return workflowType === "research-pipeline" || workflowType === "paper-writing" || workflowType === "multi-agent-paper-review";
+}
+
+async function runMultiAgentPaperReview(repoPath: string, runDir: string, runId: string, stepId: string, topic: string) {
+  const reviewDir = path.join(repoPath, "review-stage");
+  const summaryPath = path.join(reviewDir, "MULTI_AGENT_REVIEW.md");
+  if (existsSync(summaryPath)) {
+    emitInsight(runDir, {
+      runId,
+      stageKey: "multi-agent-paper-review",
+      title: "成稿后多 Agent 评审",
+      status: "completed",
+      bullets: ["已检测到现有综合评审报告，跳过重复评审。"],
+      blockers: [],
+      nextActions: ["打开 review-stage/MULTI_AGENT_REVIEW.md 查看综合评分。"],
+      agentName: "ARIS Paper Studio",
+      timestamp: nowIso()
+    }, stepId);
+    return;
+  }
+  mkdirSync(reviewDir, { recursive: true });
+  emitInsight(runDir, {
+    runId,
+    stageKey: "multi-agent-paper-review",
+    title: "成稿后多 Agent 评审",
+    status: "running",
+    bullets: ["正在启动 3 个独立评审 agent：创新性、实验可信度、写作/投稿适配。"],
+    blockers: [],
+    nextActions: ["等待分项评审报告和综合评分。"],
+    agentName: "ARIS Paper Studio",
+    timestamp: nowIso()
+  }, stepId);
+
+  const reviewers = [
+    { key: "innovation", name: "创新性评审 Agent", file: "AGENT_INNOVATION_REVIEW.md", focus: "创新性、相关工作差异、方法新颖程度" },
+    { key: "evidence", name: "实验可信度评审 Agent", file: "AGENT_EVIDENCE_REVIEW.md", focus: "实验设计、结果可信度、消融和统计证据" },
+    { key: "writing", name: "写作与投稿适配评审 Agent", file: "AGENT_WRITING_REVIEW.md", focus: "论文结构、表达质量、目标会议或期刊适配性" }
+  ];
+  const executor = getExecutor("executor-codex");
+  const results = await Promise.all(reviewers.map(async (reviewer) => {
+    const prompt = buildReviewerPrompt(topic, reviewer.name, reviewer.focus, path.join("review-stage", reviewer.file));
+    const result = await execa(executor.executablePath, ["exec", "-C", repoPath, "--skip-git-repo-check", "--sandbox", "workspace-write", prompt], {
+      cwd: repoPath,
+      env: { ...UTF8_PROCESS_ENV, ...(executor.env ?? {}) },
+      reject: false,
+      timeout: 300000
+    }).catch((error) => ({ exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) }));
+    return { reviewer, result };
+  }));
+  const failures = results.filter((item) => item.result.exitCode !== 0);
+  writeMultiAgentSummary(repoPath, topic, results.map((item) => item.reviewer.file), failures.map((item) => `${item.reviewer.name}: ${item.result.stderr || item.result.stdout}`));
+  emitInsight(runDir, {
+    runId,
+    stageKey: "multi-agent-paper-review",
+    title: "成稿后多 Agent 评审",
+    status: failures.length === reviewers.length ? "blocked" : "completed",
+    bullets: [
+      `已完成 ${reviewers.length - failures.length}/${reviewers.length} 个评审 agent。`,
+      "综合评审已写入 review-stage/MULTI_AGENT_REVIEW.md。"
+    ],
+    blockers: failures.slice(0, 3).map((item) => `${item.reviewer.name} 失败：${item.result.stderr || item.result.stdout || "无输出"}`),
+    nextActions: ["查看综合评分、主要拒稿风险和必须修改项。"],
+    agentName: "ARIS Paper Studio",
+    timestamp: nowIso()
+  }, stepId);
+}
+
+function buildReviewerPrompt(topic: string, agentName: string, focus: string, outputPath: string) {
+  return [
+    `你是 ${agentName}。`,
+    `研究主题：${topic}`,
+    `评审重点：${focus}`,
+    "请读取当前仓库中的论文、报告、实验结果和已有产物，完成独立中文评审。",
+    "必须写入指定 Markdown 文件，不要只在终端输出。",
+    `输出文件：${outputPath}`,
+    "报告必须包含：0-10 分评分、主要优点、主要问题、拒稿风险、必须修改项、可选增强项。",
+    "正文以中文为主；论文标题、术语、代码、引用可保留英文。",
+    "不要执行 destructive Git 命令，不要 commit 或 push。"
+  ].join("\n");
+}
+
+function writeMultiAgentSummary(repoPath: string, topic: string, reviewFiles: string[], failures: string[]) {
+  const reviewDir = path.join(repoPath, "review-stage");
+  mkdirSync(reviewDir, { recursive: true });
+  const summaries = reviewFiles.map((file) => {
+    const fullPath = path.join(reviewDir, file);
+    if (!existsSync(fullPath)) return `- ${file}: 未生成。`;
+    const text = readTextFile(fullPath).slice(0, 2500);
+    return `## ${file}\n\n${text}`;
+  });
+  const content = [
+    "# 多 Agent 综合论文评审",
+    "",
+    `- 研究主题：${topic}`,
+    `- 生成时间：${nowIso()}`,
+    "",
+    "## 总体评分",
+    "",
+    "请结合下方三个评审 agent 的分报告进行人工复核。若某个 agent 未成功生成报告，本节评分应视为暂定。",
+    "",
+    "## 分项评审摘录",
+    "",
+    summaries.join("\n\n"),
+    "",
+    "## 主要拒稿风险",
+    "",
+    "- 请优先检查创新性是否足够清晰、实验是否能支撑核心主张、写作是否匹配目标会议或期刊。",
+    "",
+    "## 必须修改项",
+    "",
+    "- 根据三个评审 agent 的意见，逐条修复高风险问题后再进入下一轮写作或投稿准备。",
+    "",
+    "## 可选增强项",
+    "",
+    "- 补充更强的消融、可视化和相关工作对照，以提高论文说服力。",
+    failures.length ? "\n## 评审执行问题\n\n" + failures.map((item) => `- ${item}`).join("\n") : "",
+    ""
+  ].join("\n");
+  writeFileSync(path.join(reviewDir, "MULTI_AGENT_REVIEW.md"), content, "utf8");
 }
 
 function shouldRetryForModelCapacity(output: string) {
@@ -341,23 +553,32 @@ function describeModelPlan(commandPlan: string[][]) {
 }
 
 function buildCodexWorkflowPrompt(workflowType: WorkflowType, topic: string) {
-  return [
+  const qualityBudget = qualityBudgetFor(workflowType);
+  return appendUtf8Guidance([
     `请在当前仓库中执行 ARIS workflow：/${workflowType}`,
     `研究主题：${topic}`,
     "当前仓库可能是一个新的研究工作区。请以 RESEARCH_BRIEF.md 作为主要输入，不要把 .aris-app/runs 的历史运行日志当作研究材料反复分析。",
+    "硬性要求：所有由你生成的 Markdown 报告、计划、评审和总结都必须以中文为主；英文论文标题、专有术语、代码、命令输出和引用可保留英文，不要机械翻译。",
     "硬性要求：在做长时间探索之前，先创建 idea-stage/IDEA_REPORT.md，写入初步研究问题、相关方向、候选 idea 和下一步计划。即使后续工具失败，也必须留下这个 Markdown 成果。",
+    "运行可视化要求：每完成一个关键阶段，向 .aris-app/runs 目录下最新 run 的 progress.zh.jsonl 追加一行 JSON，字段为 stageKey、title、status、bullets、blockers、nextActions、agentName、timestamp。bullets、blockers、nextActions 必须是中文数组。",
+    "运行可视化约束：只在真实进入、完成、受阻或失败某个阶段时写 progress.zh.jsonl；不要提前写未来阶段的 pending 记录，也不要伪造尚未发生的阶段。",
+    "完整论文生成要求：如果 workflow 是 /research-pipeline，请按顺序推进：idea-discovery、写作前 auto-review-loop、experiment-bridge、paper-plan、paper-write、paper-compile、成稿后 multi-agent-paper-review。",
+    "成稿后 multi-agent-paper-review 要求：默认模拟或调用 3 个评审 agent，分别负责创新性、实验可信度、写作/投稿适配；每个 agent 输出中文分报告和 0-10 分，最后生成 review-stage/MULTI_AGENT_REVIEW.md，包含总分、分项分、主要拒稿风险、必须修改项、可选增强项。",
+    `质量预算要求：本次任务属于“${qualityBudget.label}”，不要用几段占位文字快速结束。除非仓库已有充分成果可复用，否则应进行接近 ${Math.round(qualityBudget.minMs / 60000)} 分钟量级的阅读、分析、比较、写作或评审，并产出至少约 ${qualityBudget.minMarkdownChars} 个中文 Markdown 字符的实质内容。`,
+    "如果你因为模型、环境或资料不足无法深入推进，请明确写出阻塞原因和已完成工作，不要伪装成完整论文生成已经完成。",
     "要求：",
     "1. 按 ARIS workflow 的语义真实推进任务，不要只输出说明。",
-    "2. 首个产物必须是 idea-stage/IDEA_REPORT.md；随后可生成 NARRATIVE_REPORT.md 或 FINAL_REPORT.md。",
-    "3. 如果可以继续推进，请生成阶段性报告、日志、LaTeX 或 PDF 产物，并写入当前仓库中的合理位置。",
-    "4. 如果当前环境缺少某个外部工具，先记录清楚缺失项，并产出可检查的 Markdown 报告。",
+    "2. 首个产物必须是 idea-stage/IDEA_REPORT.md；随后可生成 NARRATIVE_REPORT.md、FINAL_REPORT.md、paper/paper.tex、paper/paper.pdf 或 review-stage/MULTI_AGENT_REVIEW.md。",
+    "3. 如果可以继续推进，请生成阶段性中文报告、日志、LaTeX 或 PDF 产物，并写入当前仓库中的合理位置。",
+    "4. 如果当前环境缺少某个外部工具，先用中文记录清楚缺失项，并产出可检查的 Markdown 报告。",
     "5. 不要执行 destructive Git 命令，不要自动 commit 或 push。",
     "6. 不要长时间只读取旧日志；如果需要参考运行记录，只读最近一次 run 的摘要即可。"
-  ].join("\n");
+  ]).join("\n");
 }
 
 function writeResearchBrief(repoPath: string, workflowType: WorkflowType, topic: string, runId: string) {
-  const brief = [
+  const qualityBudget = qualityBudgetFor(workflowType);
+  const brief = appendUtf8Guidance([
     "# Research Brief",
     "",
     `- Topic: ${topic}`,
@@ -365,21 +586,34 @@ function writeResearchBrief(repoPath: string, workflowType: WorkflowType, topic:
     `- Run ID: ${runId}`,
     `- Created At: ${nowIso()}`,
     "",
-    "## Objective",
+    "## 目标",
     "",
-    "Run the ARIS research workflow and produce concrete local artifacts in this repository.",
+    "运行 ARIS 科研 workflow，并在当前仓库中产出可检查的中文 Markdown 报告、论文草稿、PDF 或评审结果。",
     "",
-    "## Required First Output",
+    "## 中文输出要求",
     "",
-    "Create `idea-stage/IDEA_REPORT.md` first. It should include problem framing, candidate ideas, novelty hypotheses, and next actions.",
+    "所有 Markdown 正文必须以中文为主；英文论文标题、专有术语、代码、命令输出和引用可以保留英文。",
     "",
-    "## Constraints",
+    "## 质量预算",
+    "",
+    `本次任务属于“${qualityBudget.label}”。除非当前仓库已有充分可复用成果，否则不要快速生成占位式报告；请投入接近 ${Math.round(qualityBudget.minMs / 60000)} 分钟量级的分析/写作/评审，并产出至少约 ${qualityBudget.minMarkdownChars} 个中文 Markdown 字符的实质内容。`,
+    "",
+    "## 必须优先产出",
+    "",
+    "先创建 `idea-stage/IDEA_REPORT.md`，内容应包含问题定义、候选 idea、创新性假设和下一步行动。",
+    "",
+    "## 运行进展",
+    "",
+    `请把阶段进展逐行追加到 \`.aris-app/runs/${runId}/progress.zh.jsonl\`，每行 JSON 至少包含 \`stageKey\`、\`title\`、\`status\`、\`bullets\`、\`nextActions\`。`,
+    "只记录真实阶段进展：阶段开始时 status 写 running，完成时写 completed，受阻或失败时写 blocked/failed；不要提前写未来阶段的 pending 行。",
+    "",
+    "## 约束",
     "",
     "- Do not treat `.aris-app/runs` as primary research content.",
     "- Do not commit or push automatically.",
-    "- If any tool or model fails, write a Markdown report explaining what was completed and what blocked progress.",
+    "- If any tool or model fails, write a Chinese Markdown report explaining what was completed and what blocked progress.",
     ""
-  ].join("\n");
+  ]).join("\n");
   writeFileSync(path.join(repoPath, "RESEARCH_BRIEF.md"), brief, "utf8");
 }
 
@@ -400,17 +634,17 @@ function ensureFallbackArtifact(repoPath: string, runId: string, workflowType: W
     `**Topic**: ${topic}`,
     `**Exit Code**: ${exitCode ?? "unknown"}`,
     "",
-    "## Status",
+    "## 状态",
     "",
-    "The workflow did not create a primary Markdown artifact before exiting. ARIS Paper Studio generated this fallback report so the run leaves a concrete, inspectable result.",
+    "Workflow 在退出前没有创建主要 Markdown 产物。ARIS Paper Studio 自动生成这份中文兜底报告，确保本次运行留下可检查结果。",
     "",
-    "## Diagnosis",
+    "## 诊断",
     "",
-    output.trim() ? output.slice(0, 8000) : "No executor output was captured.",
+    output.trim() ? output.slice(0, 8000) : "没有捕获到执行器输出。",
     "",
-    "## Next Step",
+    "## 下一步",
     "",
-    "Retry the workflow with a lighter model or provide more project context in `RESEARCH_BRIEF.md`.",
+    "请检查运行日志；如果是模型或环境问题，可以换用更轻量模型后重试，或在 `RESEARCH_BRIEF.md` 中补充更多项目上下文。",
     ""
   ].join("\n");
   writeFileSync(path.join(outDir, "IDEA_REPORT.md"), report, "utf8");
@@ -425,8 +659,328 @@ function emit(runDir: string, event: ExecuteEvent) {
   }
 }
 
-function hasCoreArtifact(repoPath: string) {
-  return CORE_ARTIFACTS.some((artifactPath) => existsSync(path.join(repoPath, artifactPath)));
+function emitInsight(runDir: string, input: Omit<RunInsight, "id">, stepId?: string) {
+  const insight: RunInsight = { ...input, id: id("insight") };
+  getDb().prepare(
+    `INSERT INTO run_insights (
+      id, run_id, stage_key, title, status, bullets_json, blockers_json, next_actions_json, agent_name, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    insight.id,
+    insight.runId,
+    insight.stageKey,
+    insight.title,
+    insight.status,
+    JSON.stringify(insight.bullets),
+    JSON.stringify(insight.blockers),
+    JSON.stringify(insight.nextActions),
+    insight.agentName ?? null,
+    insight.timestamp
+  );
+  emit(runDir, {
+    runId: insight.runId,
+    stepId,
+    type: "insight",
+    message: `${insight.title}：${insight.bullets[0] ?? insight.status}`,
+    timestamp: insight.timestamp,
+    payload: insight
+  });
+}
+
+function listRunInsights(runId: string): RunInsight[] {
+  const rows = getDb()
+    .prepare("SELECT * FROM run_insights WHERE run_id = ? ORDER BY created_at ASC")
+    .all(runId) as any[];
+  return rows.map((row) => ({
+    id: row.id,
+    runId: row.run_id,
+    stageKey: row.stage_key,
+    title: row.title,
+    status: row.status,
+    bullets: parseJson<string[]>(row.bullets_json, []),
+    blockers: parseJson<string[]>(row.blockers_json, []),
+    nextActions: parseJson<string[]>(row.next_actions_json, []),
+    agentName: row.agent_name,
+    timestamp: row.created_at
+  }));
+}
+
+function buildRunStages(defaultWorkflowId: string | null | undefined, workflowType: WorkflowType) {
+  const canonical = canonicalStagesFor(workflowType);
+  if (canonical.length > 0) return canonical;
+  if (defaultWorkflowId) {
+    try {
+      const template = getWorkflowTemplate(defaultWorkflowId);
+      const stages = template.nodes.filter((node) => node.enabled).map((node) => node.nodeKey);
+      if (stages.length > 0) return stages;
+    } catch {
+      // Fall back to the launch type below.
+    }
+  }
+  return [workflowType];
+}
+
+function canonicalStagesFor(workflowType: WorkflowType) {
+  if (workflowType === "research-pipeline") {
+    return ["idea-discovery", "auto-review-loop", "experiment-bridge", "paper-plan", "paper-write", "paper-compile", "multi-agent-paper-review"];
+  }
+  if (workflowType === "paper-writing") return ["paper-plan", "paper-write", "paper-compile", "multi-agent-paper-review"];
+  if (workflowType === "multi-agent-paper-review") return ["multi-agent-paper-review"];
+  return [];
+}
+
+function createProgressInsightState(): ProgressInsightState {
+  return {
+    cursor: 0,
+    seenStageKeys: new Set<string>()
+  };
+}
+
+function emitInitialStage(
+  runDir: string,
+  runId: string,
+  stages: string[],
+  state: ProgressInsightState,
+  stepId: string | undefined,
+  timestamp = nowIso()
+) {
+  const firstStageKey = stages[0];
+  if (!firstStageKey) return;
+  state.seenStageKeys.add(firstStageKey);
+  state.activeStageKey = firstStageKey;
+  emitInsight(runDir, {
+    runId,
+    stageKey: firstStageKey,
+    title: STAGE_TITLES[firstStageKey] ?? firstStageKey,
+    status: "running",
+    bullets: ["正在启动该阶段。"],
+    blockers: [],
+    nextActions: ["等待执行器写入真实阶段进展。"],
+    agentName: "ARIS Paper Studio",
+    timestamp
+  }, stepId);
+}
+
+function watchProgressFile(progressPath: string, onChange: () => void) {
+  let watcher: FSWatcher | undefined;
+  let closed = false;
+  let pending = false;
+  const flushSoon = () => {
+    if (closed || pending) return;
+    pending = true;
+    setTimeout(() => {
+      pending = false;
+      if (!closed) onChange();
+    }, 100);
+  };
+  try {
+    watcher = watch(progressPath, { persistent: false }, flushSoon);
+  } catch {
+    watcher = undefined;
+  }
+  const poller = setInterval(onChange, 3000);
+  return {
+    close() {
+      closed = true;
+      clearInterval(poller);
+      watcher?.close();
+    }
+  };
+}
+
+function emitProgressInsights(
+  progressPath: string,
+  runDir: string,
+  runId: string,
+  stepId: string | undefined,
+  state: ProgressInsightState
+) {
+  if (!existsSync(progressPath)) return;
+  let lines: string[];
+  try {
+    const text = readTextFile(progressPath);
+    const rawLines = text.split(/\r?\n/);
+    if (rawLines.at(-1) === "") {
+      rawLines.pop();
+    } else {
+      rawLines.pop();
+    }
+    lines = rawLines.filter(Boolean);
+  } catch {
+    return;
+  }
+  for (const line of lines.slice(state.cursor)) {
+    try {
+      const parsed = JSON.parse(line) as Partial<RunInsight>;
+      emitProgressInsight(runDir, runId, stepId, state, {
+        stageKey: parsed.stageKey ?? "artifact-summary",
+        title: parsed.title ?? STAGE_TITLES[parsed.stageKey ?? "artifact-summary"] ?? "运行进展",
+        status: coerceProgressStatus(parsed.status),
+        bullets: Array.isArray(parsed.bullets) ? parsed.bullets.map(String).slice(0, 8) : [],
+        blockers: Array.isArray(parsed.blockers) ? parsed.blockers.map(String).slice(0, 5) : [],
+        nextActions: Array.isArray(parsed.nextActions) ? parsed.nextActions.map(String).slice(0, 5) : [],
+        agentName: parsed.agentName ?? "执行器",
+        timestamp: parsed.timestamp ?? nowIso()
+      });
+    } catch {
+      emitProgressInsight(runDir, runId, stepId, state, {
+        stageKey: "artifact-summary",
+        title: "运行进展",
+        status: "running",
+        bullets: [line.slice(0, 300)],
+        blockers: [],
+        nextActions: [],
+        agentName: "执行器",
+        timestamp: nowIso()
+      });
+    }
+  }
+  state.cursor = lines.length;
+}
+
+function emitProgressInsight(
+  runDir: string,
+  runId: string,
+  stepId: string | undefined,
+  state: ProgressInsightState,
+  insight: Omit<RunInsight, "id" | "runId">
+) {
+  const isNewStage = !state.seenStageKeys.has(insight.stageKey);
+  if (isNewStage && state.activeStageKey && state.activeStageKey !== insight.stageKey) {
+    emitInsight(runDir, {
+      runId,
+      stageKey: state.activeStageKey,
+      title: STAGE_TITLES[state.activeStageKey] ?? state.activeStageKey,
+      status: "completed",
+      bullets: ["已进入下一阶段，上一阶段自动标记为完成。"],
+      blockers: [],
+      nextActions: [],
+      agentName: "ARIS Paper Studio",
+      timestamp: offsetIso(insight.timestamp, -1)
+    }, stepId);
+  }
+  state.seenStageKeys.add(insight.stageKey);
+  state.activeStageKey = insight.status === "running" ? insight.stageKey : undefined;
+  emitInsight(runDir, {
+    runId,
+    ...insight
+  }, stepId);
+}
+
+function offsetIso(value: string, offsetMs: number) {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return nowIso();
+  return new Date(parsed + offsetMs).toISOString();
+}
+
+function coerceProgressStatus(value: unknown): RunInsightStatus {
+  return value === "completed" || value === "blocked" || value === "failed" || value === "running"
+    ? value
+    : "running";
+}
+
+function emitArtifactSummary(repoPath: string, runDir: string, runId: string, stepId: string | undefined, changedSince: Date) {
+  const summaries = CORE_ARTIFACTS
+    .map((artifactPath) => summarizeArtifact(repoPath, artifactPath, changedSince))
+    .filter(Boolean) as string[];
+  if (summaries.length === 0) return;
+  emitInsight(runDir, {
+    runId,
+    stageKey: "artifact-summary",
+    title: "成果摘要",
+    status: "completed",
+    bullets: summaries.slice(0, 6),
+    blockers: [],
+    nextActions: ["打开成果预览查看完整 Markdown、PDF 和多 Agent 评审报告。"],
+    agentName: "ARIS Paper Studio",
+    timestamp: nowIso()
+  }, stepId);
+}
+
+function emitQualityRiskIfNeeded(
+  repoPath: string,
+  runDir: string,
+  runId: string,
+  stepId: string,
+  workflowType: WorkflowType,
+  startedAt: Date,
+  endedAt: Date
+) {
+  const budget = qualityBudgetFor(workflowType);
+  const elapsedMs = endedAt.getTime() - startedAt.getTime();
+  const markdownChars = countChangedMarkdownChars(repoPath, startedAt);
+  const risks: string[] = [];
+  if (elapsedMs < budget.minMs) {
+    risks.push(`运行耗时约 ${Math.max(1, Math.round(elapsedMs / 60000))} 分钟，低于“${budget.label}”建议的 ${Math.round(budget.minMs / 60000)} 分钟深度工作预算。`);
+  }
+  if (markdownChars < budget.minMarkdownChars) {
+    risks.push(`本轮新增/更新 Markdown 实质内容约 ${markdownChars} 字符，低于建议阈值 ${budget.minMarkdownChars} 字符。`);
+  }
+  if (risks.length === 0) return;
+  emitInsight(runDir, {
+    runId,
+    stageKey: "quality-risk",
+    title: "质量风险",
+    status: "blocked",
+    bullets: risks,
+    blockers: ["本轮输出可能偏浅，建议不要直接视为完整高质量成果。"],
+    nextActions: ["重新运行并延长分析预算，或在 Codex 对话中要求针对当前成果做深度补写/评审。"],
+    agentName: "ARIS Paper Studio",
+    timestamp: nowIso()
+  }, stepId);
+}
+
+function qualityBudgetFor(workflowType: WorkflowType) {
+  return QUALITY_BUDGETS[workflowType] ?? { minMs: 2 * 60 * 1000, minMarkdownChars: 1500, label: workflowType };
+}
+
+function countChangedMarkdownChars(repoPath: string, changedSince: Date) {
+  const files = [
+    path.join(repoPath, "idea-stage", "IDEA_REPORT.md"),
+    path.join(repoPath, "NARRATIVE_REPORT.md"),
+    path.join(repoPath, "FINAL_REPORT.md"),
+    path.join(repoPath, "PIPELINE_REPORT.md"),
+    path.join(repoPath, "review-stage", "AUTO_REVIEW.md"),
+    path.join(repoPath, "review-stage", "MULTI_AGENT_REVIEW.md"),
+    path.join(repoPath, "paper", "paper.tex")
+  ];
+  return files.reduce((total, filePath) => {
+    if (!existsSync(filePath) || statMtime(filePath) < changedSince) return total;
+    try {
+      return total + readTextFile(filePath).trim().length;
+    } catch {
+      return total;
+    }
+  }, 0);
+}
+
+function summarizeArtifact(repoPath: string, artifactPath: string, changedSince: Date) {
+  const fullPath = path.join(repoPath, artifactPath);
+  if (!existsSync(fullPath)) return null;
+  if (statMtime(fullPath) < changedSince) return null;
+  try {
+    const text = readTextFile(fullPath);
+    const heading = text.split(/\r?\n/).find((line) => /^#{1,3}\s+/.test(line))?.replace(/^#{1,3}\s+/, "").trim();
+    return `${artifactPath} 已生成${heading ? `：${heading}` : ""}`;
+  } catch {
+    return `${artifactPath} 已生成`;
+  }
+}
+
+function hasCoreArtifact(repoPath: string, changedSince?: Date) {
+  return CORE_ARTIFACTS.some((artifactPath) => {
+    const fullPath = path.join(repoPath, artifactPath);
+    if (!existsSync(fullPath)) return false;
+    return changedSince ? statMtime(fullPath) >= changedSince : true;
+  });
+}
+
+function statMtime(filePath: string) {
+  try {
+    return statSync(filePath).mtime;
+  } catch {
+    return new Date(0);
+  }
 }
 
 function prepareEventMessage(message: string) {
@@ -463,7 +1017,7 @@ function readEventsForRun(runId: string): ExecuteEvent[] {
   if (!step?.stdout_path) return [];
   const eventsPath = path.join(path.dirname(step.stdout_path), "events.jsonl");
   try {
-    return readFileSync(eventsPath, "utf8")
+    return readTextFile(eventsPath)
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line: string) => JSON.parse(line));

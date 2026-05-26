@@ -16,8 +16,9 @@ import {
   stageAll
 } from "./services/repository.service";
 import { artifactFileUrl, listArtifacts, readArtifactText, rescanArtifacts } from "./services/artifact.service";
+import { applyCodexEdit, listCodexChatMessages, previewCodexEdit, sendCodexChat } from "./services/codex-chat.service";
 import { cleanupInterruptedRuns, getRun, listRuns, startRun, stopRun } from "./services/run.service";
-import { ensureDefaultWorkflows, getWorkflowTemplate, listWorkflowTemplates, saveWorkflowTemplate } from "./services/workflow.service";
+import { ensureDefaultWorkflows, getWorkflowTemplate, listWorkflowTemplates, resetWorkflowTemplate, saveWorkflowTemplate } from "./services/workflow.service";
 
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
@@ -95,6 +96,12 @@ function registerIpc() {
   ipcMain.handle("workflow:list", () => listWorkflowTemplates());
   ipcMain.handle("workflow:get", (_event, id) => getWorkflowTemplate(id));
   ipcMain.handle("workflow:save", (_event, input) => saveWorkflowTemplate(input));
+  ipcMain.handle("workflow:reset", (_event, id) => resetWorkflowTemplate(id));
+
+  ipcMain.handle("codex-chat:list", (_event, projectId) => listCodexChatMessages(projectId));
+  ipcMain.handle("codex-chat:send", (_event, input) => sendCodexChat(input));
+  ipcMain.handle("codex-chat:preview-edit", (_event, messageId) => previewCodexEdit(messageId));
+  ipcMain.handle("codex-chat:apply-edit", (_event, messageId) => applyCodexEdit(messageId));
 
   ipcMain.handle("executor:list", () => listExecutors());
   ipcMain.handle("executor:save", (_event, input) => saveExecutor(input));

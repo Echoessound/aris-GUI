@@ -1,4 +1,4 @@
-import { Button, Input, List, message, Space, Typography } from "antd";
+import { Button, Input, List, message, Space, Tag, Typography } from "antd";
 import { useEffect, useState } from "react";
 import type { GitStatus, Project } from "../../shared/types";
 import { api } from "../api/electronApi";
@@ -31,6 +31,7 @@ export function GitPanel({ project }: { project: Project }) {
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
       <Space wrap>
+        <Tag color={status?.isDirty ? "orange" : "green"}>{status?.isDirty ? "有未提交改动" : "工作区干净"}</Tag>
         <Typography.Text>分支：{status?.branch ?? "-"}</Typography.Text>
         <Typography.Text>ahead {status?.ahead ?? 0} / behind {status?.behind ?? 0}</Typography.Text>
         <Typography.Text>origin：{status?.remoteOrigin ?? "未配置"}</Typography.Text>
@@ -48,6 +49,7 @@ export function GitPanel({ project }: { project: Project }) {
         <Input value={messageText} onChange={(event) => setMessageText(event.target.value)} placeholder="commit message" />
         <Button
           type="primary"
+          disabled={!messageText.trim()}
           onClick={async () => {
             await api.repositories.commit(repositoryId, messageText);
             message.success("已提交到 Git");
@@ -55,7 +57,7 @@ export function GitPanel({ project }: { project: Project }) {
             await refresh();
           }}
         >
-          提交到 Git
+          提交
         </Button>
         <Button
           onClick={async () => {
@@ -64,7 +66,7 @@ export function GitPanel({ project }: { project: Project }) {
             await refresh();
           }}
         >
-          推送到远程仓库
+          推送
         </Button>
       </Space.Compact>
       <List

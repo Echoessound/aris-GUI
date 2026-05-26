@@ -20,7 +20,7 @@ export function StartupDiagnostics() {
       setDiagnostics({
         found: false,
         skillsFound: false,
-        installHint: "启动诊断执行失败，请进入执行器配置页手动检查 ARIS CLI 和 ARIS skills。",
+        installHint: "启动诊断执行失败，请进入执行器与诊断页面手动检查 ARIS CLI 和 ARIS skills。",
         error: error instanceof Error ? error.message : String(error)
       });
       setState("warning");

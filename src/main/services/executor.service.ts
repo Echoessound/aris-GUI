@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { getDb, id, nowIso, parseJson } from "../db/database";
 import type { ArisDiagnostics, ExecutorConfig, ExecutorTestResult, SaveExecutorInput } from "../../shared/types";
+import { UTF8_PROCESS_ENV } from "./encoding.service";
 
 const BLOCKED_DEFAULT_MODELS = new Set(["", "auto", "default", "gpt-5.4"]);
 const ARIS_SKILL_NAMES = [
@@ -105,7 +106,7 @@ export async function testExecutor(executorId: string): Promise<ExecutorTestResu
   try {
     const result = await execa(executor.executablePath, args, {
       cwd: executor.workingDirectory || undefined,
-      env: executor.env,
+      env: { ...UTF8_PROCESS_ENV, ...(executor.env ?? {}) },
       timeout: 15000,
       reject: false
     });
@@ -175,7 +176,7 @@ export async function diagnoseAris(): Promise<ArisDiagnostics> {
 async function detectCommand(candidates: string[]) {
   for (const candidate of candidates) {
     try {
-      const result = await execa(candidate, ["--version"], { timeout: 10000, reject: false });
+      const result = await execa(candidate, ["--version"], { timeout: 10000, reject: false, env: UTF8_PROCESS_ENV });
       if (result.exitCode === 0 || result.stdout || result.stderr) {
         return {
           found: true,

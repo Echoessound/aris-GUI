@@ -1,31 +1,47 @@
-import { Alert, Button, Descriptions, Empty, Form, Input, message, Select, Space, Tabs, Tooltip, Typography } from "antd";
-import { PlayCircleOutlined, ReloadOutlined, StopOutlined } from "@ant-design/icons";
-import { useEffect, useMemo, useState } from "react";
-import type { ExecuteEvent, Run, WorkflowType } from "../../shared/types";
+import { Alert, Button, Empty, Form, Input, message, Select, Space, Tabs, Tag, Tooltip, Typography } from "antd";
+import { FolderOpenOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from "@ant-design/icons";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ExecuteEvent, Run, RunInsight, WorkflowType } from "../../shared/types";
 import { api } from "../api/electronApi";
 import { useProjectStore } from "../stores/projectStore";
 import { ArtifactPreview } from "../components/ArtifactPreview";
+import { CodexChatPanel } from "../components/CodexChatPanel";
 import { GitPanel } from "../components/GitPanel";
 import { LogViewer } from "../components/LogViewer";
+import { RunInsightPanel } from "../components/RunInsightPanel";
 import { RunTimeline } from "../components/RunTimeline";
 
 const workflowOptions: Array<{ value: WorkflowType; label: string }> = [
-  { value: "research-pipeline", label: "启动完整 research-pipeline" },
-  { value: "idea-discovery", label: "仅启动 idea-discovery" },
-  { value: "experiment-bridge", label: "仅启动 experiment-bridge" },
-  { value: "auto-review-loop", label: "仅启动 auto-review-loop" },
-  { value: "paper-writing", label: "仅启动 paper-writing" }
+  { value: "research-pipeline", label: "完整 research-pipeline" },
+  { value: "idea-discovery", label: "仅 idea-discovery" },
+  { value: "experiment-bridge", label: "仅 experiment-bridge" },
+  { value: "auto-review-loop", label: "仅 auto-review-loop" },
+  { value: "paper-writing", label: "论文写作 paper-writing" },
+  { value: "multi-agent-paper-review", label: "多 Agent 论文评审" }
 ];
+
+const projectStatusText: Record<string, string> = {
+  draft: "待配置",
+  ready: "可运行",
+  running: "运行中",
+  waiting_approval: "等待确认",
+  failed: "失败",
+  completed: "已完成",
+  archived: "已归档"
+};
 
 export function ProjectDetailPage() {
   const store = useProjectStore();
   const project = useMemo(() => store.projects.find((item) => item.id === store.selectedProjectId), [store.projects, store.selectedProjectId]);
   const [workflowType, setWorkflowType] = useState<WorkflowType>("research-pipeline");
   const [events, setEvents] = useState<ExecuteEvent[]>([]);
+  const [insights, setInsights] = useState<RunInsight[]>([]);
   const [runningId, setRunningId] = useState<string>();
+  const activeRunIdRef = useRef<string | undefined>(undefined);
   const [form] = Form.useForm();
   const codexExecutor = store.executors.find((executor) => executor.id === "executor-codex") ?? store.executors[0];
   const defaultWorkflow = store.workflows.find((workflow) => workflow.id === "workflow-research-pipeline") ?? store.workflows[0];
+  const latestRun = store.runs[0];
 
   useEffect(() => {
     void store.load();
@@ -33,14 +49,20 @@ export function ProjectDetailPage() {
 
   useEffect(() => {
     const dispose = api.runs.onEvent((event) => {
+      if (activeRunIdRef.current && event.runId !== activeRunIdRef.current) return;
+      if (!activeRunIdRef.current && !runningId) return;
       setEvents((current) => [...current, event]);
+      if (event.type === "insight" && event.payload) {
+        setInsights((current) => [...current, event.payload!]);
+      }
       if (event.type === "exit" || event.type === "error") {
         void store.refreshSelected();
         setRunningId(undefined);
+        activeRunIdRef.current = undefined;
       }
     });
     return dispose;
-  }, []);
+  }, [runningId]);
 
   useEffect(() => {
     if (project) {
@@ -56,7 +78,7 @@ export function ProjectDetailPage() {
   }, [project, codexExecutor?.id, defaultWorkflow?.id]);
 
   if (!project) {
-    return <Empty description="请先在项目列表中新建或选择项目" />;
+    return <Empty description="请先在项目操作台中新建或选择项目" />;
   }
   const activeProject = project;
 
@@ -68,7 +90,7 @@ export function ProjectDetailPage() {
         defaultExecutorId: values.defaultExecutorId ?? codexExecutor?.id,
         defaultWorkflowId: values.defaultWorkflowId ?? defaultWorkflow?.id
       });
-      message.success(next.status === "ready" ? "项目配置已保存，状态已更新为可运行" : "项目配置已保存");
+      message.success(next.status === "ready" ? "项目配置已保存，当前可运行" : "项目配置已保存");
       await store.refreshSelected();
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error));
@@ -87,10 +109,19 @@ export function ProjectDetailPage() {
     }
   }
 
+  async function openRepositoryFolder() {
+    if (!activeProject.repository?.path) {
+      message.warning("请先绑定本地仓库");
+      return;
+    }
+    const error = await api.shell.openPath(activeProject.repository.path);
+    if (error) message.error(error);
+  }
+
   async function start() {
     try {
       if (!activeProject.repositoryId) {
-        message.warning("请先绑定本地仓库。可以选择普通文件夹，应用会自动初始化 Git。");
+        message.warning("请先绑定本地仓库。可以选择普通文件夹，应用会自动 git init。");
         await bindRepo();
         return;
       }
@@ -101,6 +132,7 @@ export function ProjectDetailPage() {
         defaultWorkflowId: values.defaultWorkflowId ?? defaultWorkflow?.id
       });
       setEvents([]);
+      setInsights([]);
       const run = await api.runs.start({
         projectId: activeProject.id,
         workflowType,
@@ -108,6 +140,10 @@ export function ProjectDetailPage() {
         topic: values.topic
       });
       setRunningId(run.id);
+      activeRunIdRef.current = run.id;
+      const detail = await api.runs.get(run.id);
+      setEvents(detail.events);
+      setInsights(detail.insights);
       message.success("Workflow 已启动");
       await store.refreshSelected();
     } catch (error) {
@@ -116,19 +152,27 @@ export function ProjectDetailPage() {
   }
 
   return (
-    <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+    <div className="page-stack">
       <div className="panel">
         <div className="toolbar">
-          <Space direction="vertical" size={0}>
-            <Typography.Title level={4}>{project.name}</Typography.Title>
-            <Typography.Text className="muted">{project.topic}</Typography.Text>
+          <Space direction="vertical" size={2} style={{ minWidth: 0 }}>
+            <Space wrap>
+              <Typography.Title level={4} style={{ margin: 0 }}>{project.name}</Typography.Title>
+              <Tag color={project.status === "running" ? "blue" : project.status === "failed" ? "red" : project.repositoryId ? "green" : "orange"}>
+                {project.repositoryId ? projectStatusText[project.status] ?? project.status : "未绑定仓库"}
+              </Tag>
+            </Space>
+            <Typography.Text className="muted" ellipsis>{project.topic}</Typography.Text>
           </Space>
-          <Space>
+          <div className="toolbar-actions">
             <Button icon={<ReloadOutlined />} onClick={() => store.refreshSelected()}>
               刷新
             </Button>
-            <Button onClick={bindRepo}>{project.repositoryId ? "更换本地仓库" : "绑定本地仓库"}</Button>
-            <Tooltip title={!project.repositoryId ? "启动前必须绑定本地仓库；可选择普通文件夹，应用会自动 git init。" : ""}>
+            <Button onClick={bindRepo}>{project.repositoryId ? "更换仓库" : "绑定仓库"}</Button>
+            <Button icon={<FolderOpenOutlined />} disabled={!project.repository?.path} onClick={openRepositoryFolder}>
+              打开仓库
+            </Button>
+            <Tooltip title={!project.repositoryId ? "启动前必须绑定本地仓库" : ""}>
               <Button type="primary" icon={<PlayCircleOutlined />} onClick={start} disabled={Boolean(runningId)}>
                 启动 Workflow
               </Button>
@@ -136,20 +180,21 @@ export function ProjectDetailPage() {
             <Button danger icon={<StopOutlined />} disabled={!runningId} onClick={async () => runningId && api.runs.stop(runningId)}>
               停止
             </Button>
-          </Space>
+          </div>
         </div>
-        <Descriptions size="small" column={4}>
-          <Descriptions.Item label="状态">{project.status}</Descriptions.Item>
-          <Descriptions.Item label="运行轮数">{project.runCount}</Descriptions.Item>
-          <Descriptions.Item label="Git 分支">{project.repository?.branch ?? "-"}</Descriptions.Item>
-          <Descriptions.Item label="仓库">{project.repository?.path ?? "未绑定"}</Descriptions.Item>
-        </Descriptions>
+        <div className="status-grid">
+          <StatusTile label="仓库" value={project.repository?.path ?? "未绑定"} mono />
+          <StatusTile label="分支" value={project.repository?.branch ?? "-"} />
+          <StatusTile label="运行轮次" value={`${project.runCount}`} />
+          <StatusTile label="最近 Run" value={latestRun ? `#${latestRun.roundIndex} · ${latestRun.status}` : "暂无"} />
+        </div>
         {!project.repositoryId && (
           <Alert
             style={{ marginTop: 12 }}
             type="warning"
             showIcon
-            message="尚未绑定本地仓库，Workflow 需要在一个 Git 工作区中运行。点击“绑定本地仓库”选择文件夹；如果不是 Git 仓库，应用会自动执行 git init。"
+            message="尚未绑定本地仓库"
+            description="Workflow 需要在 Git 工作区中运行。请选择一个研究仓库或空文件夹，应用会在需要时自动初始化 Git。"
           />
         )}
       </div>
@@ -171,7 +216,7 @@ export function ProjectDetailPage() {
                   <Form.Item name="description" label="研究方向描述">
                     <Input.TextArea rows={3} />
                   </Form.Item>
-                  <Space style={{ width: "100%" }} align="start">
+                  <Space style={{ width: "100%" }} align="start" wrap>
                     <Form.Item name="targetVenue" label="目标会议或期刊" style={{ width: 240 }}>
                       <Input />
                     </Form.Item>
@@ -194,38 +239,51 @@ export function ProjectDetailPage() {
           },
           {
             key: "runs",
-            label: "运行记录",
+            label: "运行",
             children: (
               <div className="panel">
                 <RunTimeline
                   runs={store.runs}
                   onOpen={async (run: Run) => {
+                    activeRunIdRef.current = run.status === "running" ? run.id : undefined;
+                    setRunningId(run.status === "running" ? run.id : undefined);
                     const detail = await api.runs.get(run.id);
                     setEvents(detail.events);
+                    setInsights(detail.insights);
                   }}
                 />
+                <RunInsightPanel insights={insights} />
                 <LogViewer events={events} />
               </div>
             )
           },
           {
             key: "artifacts",
-            label: "成果预览",
+            label: "产物预览",
             children: (
               <div className="panel">
                 <Button onClick={async () => {
-            await api.artifacts.rescan(activeProject.id);
+                  await api.artifacts.rescan(activeProject.id);
                   await store.refreshSelected();
                 }}>
-                  扫描成果
+                  扫描产物
                 </Button>
-                <ArtifactPreview artifacts={store.artifacts} />
+                <ArtifactPreview artifacts={store.artifacts} runs={store.runs} />
+              </div>
+            )
+          },
+          {
+            key: "codex-chat",
+            label: "Codex 对话",
+            children: (
+              <div className="panel">
+                <CodexChatPanel projectId={activeProject.id} />
               </div>
             )
           },
           {
             key: "git",
-            label: "Git 变更",
+            label: "Git 交付",
             children: (
               <div className="panel">
                 <GitPanel project={project} />
@@ -234,6 +292,15 @@ export function ProjectDetailPage() {
           }
         ]}
       />
-    </Space>
+    </div>
+  );
+}
+
+function StatusTile({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="status-tile">
+      <span className="status-label">{label}</span>
+      <span className={`status-value${mono ? " mono" : ""}`} title={value}>{value}</span>
+    </div>
   );
 }

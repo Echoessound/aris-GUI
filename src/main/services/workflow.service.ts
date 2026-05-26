@@ -2,18 +2,13 @@ import { getDb, id, nowIso, parseJson } from "../db/database";
 import type { SaveWorkflowTemplateInput, WorkflowTemplate, WorkflowTemplateDetail } from "../../shared/types";
 
 const defaultNodeKeys = [
-  "research-lit",
-  "idea-creator",
-  "novelty-check",
-  "research-refine",
-  "experiment-plan",
-  "experiment-bridge",
+  "idea-discovery",
   "auto-review-loop",
+  "experiment-bridge",
   "paper-plan",
-  "paper-figure",
   "paper-write",
   "paper-compile",
-  "auto-paper-improvement-loop"
+  "multi-agent-paper-review"
 ];
 
 const templates = [
@@ -21,13 +16,18 @@ const templates = [
   ["workflow-idea-discovery", "立题发现", "生成选题、调研、创新点和实验计划", "idea-discovery"],
   ["workflow-experiment-bridge", "实验桥接", "根据实验计划生成代码、运行初步实验、收集结果", "experiment-bridge"],
   ["workflow-auto-review-loop", "自动审稿循环", "对结果或论文草稿进行多轮审稿与修复", "auto-review-loop"],
-  ["workflow-paper-writing", "论文写作", "从 NARRATIVE_REPORT.md 生成论文结构、LaTeX 和 PDF", "paper-writing"]
+  ["workflow-paper-writing", "论文写作", "从 NARRATIVE_REPORT.md 生成论文结构、LaTeX 和 PDF", "paper-writing"],
+  ["workflow-multi-agent-paper-review", "多 Agent 论文评审", "三位评审 agent 对成稿进行分项评分并生成综合评审", "multi-agent-paper-review"]
 ] as const;
 
 export function ensureDefaultWorkflows() {
   const db = getDb();
   const count = db.prepare("SELECT COUNT(*) as count FROM workflow_templates").get() as { count: number };
-  if (count.count > 0) return;
+  if (count.count > 0) {
+    ensureMissingBuiltInWorkflows();
+    migrateLegacyBuiltInResearchWorkflow();
+    return;
+  }
   const stamp = nowIso();
   const insertTemplate = db.prepare(`
     INSERT INTO workflow_templates (id, name, description, is_default, created_at, updated_at)
@@ -57,40 +57,147 @@ export function ensureDefaultWorkflows() {
         createdAt: stamp,
         updatedAt: stamp
       });
-      const keys = workflowType === "research-pipeline" ? defaultNodeKeys : [workflowType];
-      const nodeIds: string[] = [];
-      keys.forEach((key, index) => {
-        const nodeId = `${templateId}-node-${key}`;
-        nodeIds.push(nodeId);
-        insertNode.run({
-          id: nodeId,
-          workflowTemplateId: templateId,
-          nodeKey: key,
-          name: key,
-          command: `/${key}`,
-          argsJson: JSON.stringify([]),
-          inputFilesJson: JSON.stringify([]),
-          outputFilesJson: JSON.stringify(defaultOutputsFor(key)),
-          enabled: 1,
-          requiresApproval: key.includes("audit") ? 1 : 0,
-          failurePolicy: "stop",
-          positionX: 80 + index * 220,
-          positionY: 120 + (index % 2) * 120,
-          createdAt: stamp,
-          updatedAt: stamp
-        });
-      });
-      for (let i = 0; i < nodeIds.length - 1; i += 1) {
-        insertEdge.run({
-          id: `${templateId}-edge-${i}`,
-          workflowTemplateId: templateId,
-          sourceNodeId: nodeIds[i],
-          targetNodeId: nodeIds[i + 1]
-        });
-      }
+      const structure = buildDefaultWorkflowStructure(templateId, workflowType, stamp);
+      structure.nodes.forEach((node) => insertNode.run(node));
+      structure.edges.forEach((edge) => insertEdge.run(edge));
     });
   });
   tx();
+}
+
+function ensureMissingBuiltInWorkflows() {
+  const db = getDb();
+  const stamp = nowIso();
+  const insertTemplate = db.prepare(`
+    INSERT INTO workflow_templates (id, name, description, is_default, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const tx = db.transaction(() => {
+    templates.forEach(([templateId, name, description, workflowType], templateIndex) => {
+      const existing = db.prepare("SELECT id FROM workflow_templates WHERE id = ?").get(templateId);
+      if (existing) return;
+      insertTemplate.run(templateId, name, description, templateIndex === 0 ? 1 : 0, stamp, stamp);
+      const structure = buildDefaultWorkflowStructure(templateId, workflowType, stamp);
+      const insertNode = db.prepare(`
+        INSERT INTO workflow_nodes (
+          id, workflow_template_id, node_key, name, command, args_json, input_files_json,
+          output_files_json, enabled, requires_approval, failure_policy, position_x, position_y, created_at, updated_at
+        ) VALUES (
+          @id, @workflowTemplateId, @nodeKey, @name, @command, @argsJson, @inputFilesJson,
+          @outputFilesJson, @enabled, @requiresApproval, @failurePolicy, @positionX, @positionY, @createdAt, @updatedAt
+        )
+      `);
+      const insertEdge = db.prepare(`
+        INSERT INTO workflow_edges (id, workflow_template_id, source_node_id, target_node_id)
+        VALUES (@id, @workflowTemplateId, @sourceNodeId, @targetNodeId)
+      `);
+      structure.nodes.forEach((node) => insertNode.run(node));
+      structure.edges.forEach((edge) => insertEdge.run(edge));
+    });
+  });
+  tx();
+}
+
+function migrateLegacyBuiltInResearchWorkflow() {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT node_key FROM workflow_nodes WHERE workflow_template_id = 'workflow-research-pipeline' ORDER BY position_x ASC")
+    .all() as Array<{ node_key: string }>;
+  const keys = rows.map((row) => row.node_key);
+  if (keys.length === 0) return;
+  const legacyKeys = new Set(["research-lit", "idea-creator", "novelty-check", "research-refine", "experiment-plan", "paper-figure", "auto-paper-improvement-loop"]);
+  const hasLegacyDefaultShape = keys.some((key) => legacyKeys.has(key)) && !keys.includes("multi-agent-paper-review");
+  if (!hasLegacyDefaultShape) return;
+  const stamp = nowIso();
+  const structure = buildDefaultWorkflowStructure("workflow-research-pipeline", "research-pipeline", stamp);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM workflow_nodes WHERE workflow_template_id = 'workflow-research-pipeline'").run();
+    db.prepare("DELETE FROM workflow_edges WHERE workflow_template_id = 'workflow-research-pipeline'").run();
+    db.prepare("UPDATE workflow_templates SET updated_at = ? WHERE id = 'workflow-research-pipeline'").run(stamp);
+    const insertNode = db.prepare(`
+      INSERT INTO workflow_nodes (
+        id, workflow_template_id, node_key, name, command, args_json, input_files_json,
+        output_files_json, enabled, requires_approval, failure_policy, position_x, position_y, created_at, updated_at
+      ) VALUES (
+        @id, @workflowTemplateId, @nodeKey, @name, @command, @argsJson, @inputFilesJson,
+        @outputFilesJson, @enabled, @requiresApproval, @failurePolicy, @positionX, @positionY, @createdAt, @updatedAt
+      )
+    `);
+    const insertEdge = db.prepare(`
+      INSERT INTO workflow_edges (id, workflow_template_id, source_node_id, target_node_id)
+      VALUES (@id, @workflowTemplateId, @sourceNodeId, @targetNodeId)
+    `);
+    structure.nodes.forEach((node) => insertNode.run(node));
+    structure.edges.forEach((edge) => insertEdge.run(edge));
+  });
+  tx();
+}
+
+export function resetWorkflowTemplate(templateId: string): WorkflowTemplateDetail {
+  ensureDefaultWorkflows();
+  const definition = templates.find(([id]) => id === templateId);
+  if (!definition) throw new Error("只能恢复内置 Workflow 模板的默认结构");
+  const [, , , workflowType] = definition;
+  const db = getDb();
+  const template = db.prepare("SELECT id FROM workflow_templates WHERE id = ?").get(templateId);
+  if (!template) throw new Error("Workflow 模板不存在");
+  const stamp = nowIso();
+  const structure = buildDefaultWorkflowStructure(templateId, workflowType, stamp);
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM workflow_nodes WHERE workflow_template_id = ?").run(templateId);
+    db.prepare("DELETE FROM workflow_edges WHERE workflow_template_id = ?").run(templateId);
+    db.prepare("UPDATE workflow_templates SET updated_at = ? WHERE id = ?").run(stamp, templateId);
+    const insertNode = db.prepare(`
+      INSERT INTO workflow_nodes (
+        id, workflow_template_id, node_key, name, command, args_json, input_files_json,
+        output_files_json, enabled, requires_approval, failure_policy, position_x, position_y, created_at, updated_at
+      ) VALUES (
+        @id, @workflowTemplateId, @nodeKey, @name, @command, @argsJson, @inputFilesJson,
+        @outputFilesJson, @enabled, @requiresApproval, @failurePolicy, @positionX, @positionY, @createdAt, @updatedAt
+      )
+    `);
+    const insertEdge = db.prepare(`
+      INSERT INTO workflow_edges (id, workflow_template_id, source_node_id, target_node_id)
+      VALUES (@id, @workflowTemplateId, @sourceNodeId, @targetNodeId)
+    `);
+    structure.nodes.forEach((node) => insertNode.run(node));
+    structure.edges.forEach((edge) => insertEdge.run(edge));
+  });
+  tx();
+  return getWorkflowTemplate(templateId);
+}
+
+function buildDefaultWorkflowStructure(templateId: string, workflowType: string, stamp: string) {
+  const keys = workflowType === "research-pipeline" ? defaultNodeKeys : [workflowType];
+  const nodeIds: string[] = [];
+  const nodes = keys.map((key, index) => {
+    const nodeId = `${templateId}-node-${key}`;
+    nodeIds.push(nodeId);
+    return {
+      id: nodeId,
+      workflowTemplateId: templateId,
+      nodeKey: key,
+          name: key,
+          command: `/${key}`,
+      argsJson: JSON.stringify([]),
+      inputFilesJson: JSON.stringify([]),
+      outputFilesJson: JSON.stringify(defaultOutputsFor(key)),
+      enabled: 1,
+      requiresApproval: key.includes("audit") ? 1 : 0,
+      failurePolicy: "stop",
+      positionX: 80 + index * 220,
+      positionY: 120 + (index % 2) * 120,
+      createdAt: stamp,
+      updatedAt: stamp
+    };
+  });
+  const edges = nodeIds.slice(0, -1).map((sourceNodeId, index) => ({
+    id: `${templateId}-edge-${index}`,
+    workflowTemplateId: templateId,
+    sourceNodeId,
+    targetNodeId: nodeIds[index + 1]
+  }));
+  return { nodes, edges };
 }
 
 function defaultOutputsFor(key: string) {
@@ -101,7 +208,8 @@ function defaultOutputsFor(key: string) {
     "paper-plan": ["PAPER_PLAN.md"],
     "paper-write": ["paper/paper.tex"],
     "paper-compile": ["paper/paper.pdf"],
-    "auto-paper-improvement-loop": ["FINAL_REPORT.md", "paper/paper.pdf"]
+    "auto-paper-improvement-loop": ["FINAL_REPORT.md", "paper/paper.pdf"],
+    "multi-agent-paper-review": ["review-stage/MULTI_AGENT_REVIEW.md"]
   };
   return map[key] ?? [];
 }

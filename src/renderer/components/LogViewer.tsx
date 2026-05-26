@@ -12,10 +12,10 @@ export function LogViewer({ events }: { events: ExecuteEvent[] }) {
 
 function limitEventMessage(message: string) {
   if (message.length <= MAX_EVENT_CHARS) return message;
-  return `${message.slice(0, MAX_EVENT_CHARS)}\n...[truncated in UI; open stdout.log/stderr.log for full output]`;
+  return `${message.slice(0, MAX_EVENT_CHARS)}\n...[UI 已截断，请打开 stdout.log/stderr.log 查看完整输出]`;
 }
 
 function limitRenderedLog(text: string) {
   if (text.length <= MAX_RENDERED_LOG_CHARS) return text;
-  return `${text.slice(0, MAX_RENDERED_LOG_CHARS)}\n\n...[log truncated in UI; open the run stdout.log/stderr.log files for full output]`;
+  return `${text.slice(0, MAX_RENDERED_LOG_CHARS)}\n\n...[日志在 UI 中已截断，请打开 run 的 stdout.log/stderr.log 查看完整输出]`;
 }

@@ -1,4 +1,5 @@
-import { Button, Form, Input, message, Select, Space, Switch, Typography } from "antd";
+import { Button, Form, Input, message, Popconfirm, Select, Space, Switch, Typography } from "antd";
+import { DeleteOutlined, UndoOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useState } from "react";
 import ReactFlow, { Background, Controls, type Node, addEdge, useEdgesState, useNodesState, type Connection } from "reactflow";
 import type { WorkflowTemplateDetail } from "../../shared/types";
@@ -22,20 +23,28 @@ export function WorkflowPage() {
     const id = templateId ?? workflows[0]?.id;
     if (!id) return;
     setTemplateId(id);
-    void api.workflows.getTemplate(id).then((next) => {
-      setDetail(next);
-      setNodes(
-        next.nodes.map((node) => ({
-          id: node.id,
-          position: { x: node.positionX, y: node.positionY },
-          data: { label: `${node.enabled ? "" : "[禁用] "}${node.name}` }
-        }))
-      );
-      setEdges(next.edges.map((edge) => ({ id: edge.id, source: edge.sourceNodeId, target: edge.targetNodeId })));
-    });
+    void loadTemplate(id);
   }, [templateId, workflows]);
 
   const nodeById = useMemo(() => new Map(detail?.nodes.map((node) => [node.id, node]) ?? []), [detail]);
+
+  function applyTemplateDetail(next: WorkflowTemplateDetail) {
+    setDetail(next);
+    setNodes(
+      next.nodes.map((node) => ({
+        id: node.id,
+        position: { x: node.positionX, y: node.positionY },
+        data: { label: `${node.enabled ? "" : "[停用] "}${node.name}` }
+      }))
+    );
+    setEdges(next.edges.map((edge) => ({ id: edge.id, source: edge.sourceNodeId, target: edge.targetNodeId })));
+    setSelectedNode(undefined);
+    form.resetFields();
+  }
+
+  async function loadTemplate(id: string) {
+    applyTemplateDetail(await api.workflows.getTemplate(id));
+  }
 
   useEffect(() => {
     const source = selectedNode ? nodeById.get(selectedNode.id) : undefined;
@@ -99,16 +108,43 @@ export function WorkflowPage() {
     setSelectedNode(node);
   }
 
+  function deleteSelectedNode() {
+    if (!selectedNode) return;
+    setNodes((current) => current.filter((node) => node.id !== selectedNode.id));
+    setEdges((current) => current.filter((edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id));
+    setSelectedNode(undefined);
+    form.resetFields();
+    message.success("节点已删除，保存模板后生效");
+  }
+
+  async function restoreDefaultStructure() {
+    if (!templateId) return;
+    const next = await api.workflows.resetTemplate(templateId);
+    applyTemplateDetail(next);
+    await load();
+    message.success("已恢复默认 Workflow 结构");
+  }
+
   return (
-    <Space align="start" style={{ width: "100%" }}>
+    <Space align="start" style={{ width: "100%" }} className="workflow-layout">
       <div className="panel" style={{ flex: 1 }}>
         <div className="toolbar">
-          <Space>
-            <Select style={{ width: 260 }} value={templateId} options={workflows.map((item) => ({ value: item.id, label: item.name }))} onChange={setTemplateId} />
+          <Space wrap>
+            <Select style={{ width: 280 }} value={templateId} options={workflows.map((item) => ({ value: item.id, label: item.name }))} onChange={setTemplateId} />
             <Button onClick={addNode}>添加节点</Button>
+            <Button danger icon={<DeleteOutlined />} disabled={!selectedNode} onClick={deleteSelectedNode}>删除节点</Button>
+            <Popconfirm
+              title="恢复默认 Workflow 结构？"
+              description="当前模板的节点和连线会被默认结构覆盖。"
+              okText="恢复"
+              cancelText="取消"
+              onConfirm={restoreDefaultStructure}
+            >
+              <Button icon={<UndoOutlined />}>恢复默认结构</Button>
+            </Popconfirm>
             <Button type="primary" onClick={save}>保存模板</Button>
           </Space>
-          <Typography.Text className="muted">可拖拽节点，连接依赖关系</Typography.Text>
+          <Typography.Text className="muted">拖拽节点并连接依赖关系，保存后用于后续运行。</Typography.Text>
         </div>
         <div className="workflow-canvas">
           <ReactFlow
