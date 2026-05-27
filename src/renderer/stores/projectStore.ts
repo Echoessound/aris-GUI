@@ -14,6 +14,8 @@ interface ProjectState {
   load(): Promise<void>;
   selectProject(id: string): Promise<void>;
   refreshSelected(): Promise<void>;
+  refreshProjectLists(id?: string): Promise<void>;
+  refreshArtifacts(id?: string): Promise<void>;
 }
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
@@ -47,6 +49,18 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ selectedProjectId: id });
     const [runs, artifacts] = await Promise.all([api.runs.list(id), api.artifacts.list(id)]);
     set({ runs, artifacts });
+  },
+  async refreshProjectLists(id) {
+    const projectId = id ?? get().selectedProjectId;
+    if (!projectId) return;
+    const [projects, runs] = await Promise.all([api.projects.list(), api.runs.list(projectId)]);
+    set({ projects, runs, selectedProjectId: projectId });
+  },
+  async refreshArtifacts(id) {
+    const projectId = id ?? get().selectedProjectId;
+    if (!projectId) return;
+    const artifacts = await api.artifacts.list(projectId);
+    set({ artifacts });
   },
   async refreshSelected() {
     const id = get().selectedProjectId;

@@ -145,6 +145,9 @@ function migrate(database: Database.Database) {
       type TEXT NOT NULL,
       name TEXT NOT NULL,
       path TEXT NOT NULL,
+      relative_path TEXT,
+      run_relative_path TEXT,
+      description TEXT,
       previewable INTEGER NOT NULL DEFAULT 1,
       size_bytes INTEGER,
       created_at TEXT NOT NULL,
@@ -169,6 +172,8 @@ function migrate(database: Database.Database) {
       project_id TEXT NOT NULL,
       role TEXT NOT NULL,
       mode TEXT NOT NULL,
+      run_id TEXT,
+      intent TEXT NOT NULL DEFAULT 'project_qa',
       content TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'completed',
       patch_text TEXT,
@@ -176,8 +181,108 @@ function migrate(database: Database.Database) {
       error_message TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS workspace_file_settings (
+      project_id TEXT PRIMARY KEY,
+      repo_dirs_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workspace_external_paths (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      path TEXT NOT NULL,
+      description TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS model_usage_events (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      run_id TEXT,
+      chat_message_id TEXT,
+      source TEXT NOT NULL,
+      model TEXT,
+      reasoning_effort TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS auto_continue_settings (
+      scope_id TEXT PRIMARY KEY,
+      project_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      scope TEXT NOT NULL DEFAULT 'all',
+      fully_automatic INTEGER NOT NULL DEFAULT 1,
+      max_continuations INTEGER NOT NULL DEFAULT 5,
+      trigger_on_failure INTEGER NOT NULL DEFAULT 1,
+      trigger_on_timeout INTEGER NOT NULL DEFAULT 1,
+      trigger_on_partial_artifacts INTEGER NOT NULL DEFAULT 1,
+      trigger_on_quality_risk INTEGER NOT NULL DEFAULT 1,
+      inherit_executor_model INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_launch_settings (
+      project_id TEXT PRIMARY KEY,
+      config_json TEXT NOT NULL,
+      extra_prompt TEXT,
+      prompt_override TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS continuation_chains (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      root_type TEXT NOT NULL,
+      root_id TEXT NOT NULL,
+      stopped INTEGER NOT NULL DEFAULT 0,
+      stop_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS continuation_events (
+      id TEXT PRIMARY KEY,
+      chain_id TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      parent_item_id TEXT,
+      continuation_index INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL,
+      summary TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
   ensureColumn(database, "codex_chat_messages", "status", "TEXT NOT NULL DEFAULT 'completed'");
+  ensureColumn(database, "codex_chat_messages", "run_id", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "intent", "TEXT NOT NULL DEFAULT 'project_qa'");
+  ensureColumn(database, "artifacts", "relative_path", "TEXT");
+  ensureColumn(database, "artifacts", "run_relative_path", "TEXT");
+  ensureColumn(database, "artifacts", "description", "TEXT");
+  ensureColumn(database, "model_usage_events", "cached_input_tokens", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(database, "runs", "parent_run_id", "TEXT");
+  ensureColumn(database, "runs", "continuation_index", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(database, "runs", "continuation_reason", "TEXT");
+  ensureColumn(database, "runs", "workflow_type", "TEXT");
+  ensureColumn(database, "runs", "launch_config_json", "TEXT");
+  ensureColumn(database, "runs", "extra_prompt", "TEXT");
+  ensureColumn(database, "runs", "prompt_override", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "conversation_id", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "parent_message_id", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "continuation_index", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(database, "codex_chat_messages", "continuation_reason", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "diagnostic_text", "TEXT");
+  ensureColumn(database, "codex_chat_messages", "answered_user_request", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(database, "codex_chat_messages", "auto_continued_from_message_id", "TEXT");
 }
 
 function ensureColumn(database: Database.Database, table: string, column: string, definition: string) {

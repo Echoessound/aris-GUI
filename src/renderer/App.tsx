@@ -46,7 +46,7 @@ function Shell() {
             { key: "home", icon: <HomeOutlined />, label: <Link to="/">项目操作台</Link> },
             { key: "projects", icon: <ExperimentOutlined />, label: <Link to="/projects">项目工作区</Link> },
             { key: "workflow", icon: <BranchesOutlined />, label: <Link to="/workflow">Workflow 模板</Link> },
-            { key: "settings", icon: <SettingOutlined />, label: <Link to="/settings">执行器与诊断</Link> }
+            { key: "settings", icon: <SettingOutlined />, label: <Link to="/settings">设置</Link> }
           ]}
         />
       </Sider>

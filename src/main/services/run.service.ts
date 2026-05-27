@@ -1,24 +1,36 @@
 import { BrowserWindow } from "electron";
 import { execa } from "execa";
-import { appendFileSync, existsSync, mkdirSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { getDb, id, nowIso, parseJson } from "../db/database";
-import type { ExecuteEvent, Run, RunDetail, RunInsight, RunInsightStatus, RunStep, StartRunInput, WorkflowType } from "../../shared/types";
-import { getExecutor } from "./executor.service";
+import type { ContinueRunInput, ExecuteEvent, Run, RunDetail, RunInsight, RunInsightStatus, RunStep, StartRunInput, WorkflowLaunchConfig, WorkflowType } from "../../shared/types";
+import { getExecutor, normalizeCodexExecutablePath } from "./executor.service";
 import { rescanArtifacts } from "./artifact.service";
 import { appendUtf8Guidance, decodeTextBuffer, readTextFile, UTF8_PROCESS_ENV } from "./encoding.service";
 import { getProject } from "./project.service";
 import { readGitStatus } from "./repository.service";
 import { getWorkflowTemplate } from "./workflow.service";
+import { recordUsageFromText } from "./model-usage.service";
+import {
+  buildRunContinuationPrompt,
+  canStartContinuation,
+  continuationReasonFromRun,
+  findOrCreateChain,
+  markContinuationStopped,
+  recordContinuationEvent
+} from "./auto-continue.service";
 
 const running = new Map<string, ReturnType<typeof execa>>();
-const DEFAULT_FALLBACK_MODELS = ["gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"];
+const DEFAULT_PRIMARY_MODEL = "gpt-5.4";
+const DEFAULT_FALLBACK_MODELS = ["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"];
+const DEFAULT_REASONING_EFFORT = "high";
 const SOFT_IDLE_TIMEOUT_MS = 300000;
 const DEFAULT_HARD_IDLE_TIMEOUT_MS = 1800000;
-const MAX_EVENT_MESSAGE_CHARS = 8192;
+const MAX_EVENT_MESSAGE_CHARS = 60000;
 const QUALITY_BUDGETS: Record<string, { minMs: number; minMarkdownChars: number; label: string }> = {
   "research-pipeline": { minMs: 10 * 60 * 1000, minMarkdownChars: 12000, label: "完整论文生成" },
   "paper-writing": { minMs: 8 * 60 * 1000, minMarkdownChars: 8000, label: "论文写作" },
+  "paper-compile": { minMs: 2 * 60 * 1000, minMarkdownChars: 800, label: "论文 PDF 编译" },
   "multi-agent-paper-review": { minMs: 5 * 60 * 1000, minMarkdownChars: 4000, label: "多 Agent 论文评审" },
   "auto-review-loop": { minMs: 5 * 60 * 1000, minMarkdownChars: 3000, label: "自动审稿" },
   "idea-discovery": { minMs: 3 * 60 * 1000, minMarkdownChars: 2500, label: "立题发现" },
@@ -32,11 +44,43 @@ const CORE_ARTIFACTS = [
   path.join("review-stage", "AUTO_REVIEW.md"),
   path.join("review-stage", "MULTI_AGENT_REVIEW.md")
 ];
+const RECOVERED_INTERRUPTED_RUN_MESSAGE = "Executor or app was interrupted, but this run produced recoverable research artifacts.";
+const INTERRUPTED_RUN_FAILED_MESSAGE = "Application restart or executor interruption; no recoverable research artifact was detected.";
+const RECOVERABLE_ARTIFACT_ROOTS = new Set([
+  "",
+  "idea-stage",
+  "implementation-stage",
+  "review-stage",
+  "paper",
+  "figures",
+  "outputs",
+  "results",
+  "benchmark",
+  "experiments",
+  "refine-logs",
+  "review-logs"
+]);
+const RECOVERABLE_IGNORED_DIRS = new Set([".git", ".aris-app", ".cache", ".pnpm-store", "node_modules", ".venv", "venv", "__pycache__", "dist", "release"]);
+const NON_COMPLETION_ARTIFACT_NAMES = new Set(["RESEARCH_BRIEF.md"]);
 
 interface ProgressInsightState {
   cursor: number;
   activeStageKey?: string;
   seenStageKeys: Set<string>;
+}
+
+interface CommandAttempt {
+  args: string[];
+  stdinText?: string;
+}
+
+interface WorkflowPromptBuildInput {
+  workflowType: WorkflowType;
+  topic: string;
+  continuationPrompt?: string;
+  launchConfig?: WorkflowLaunchConfig | null;
+  extraPrompt?: string | null;
+  promptOverride?: string | null;
 }
 
 const STAGE_TITLES: Record<string, string> = {
@@ -66,6 +110,75 @@ export function getRun(runId: string): RunDetail {
 }
 
 export function cleanupInterruptedRuns() {
+  if (process.env.ARIS_USE_LEGACY_INTERRUPTED_RUN_CLEANUP === "1") {
+    cleanupInterruptedRunsLegacy();
+    return;
+  }
+  const endedAt = nowIso();
+  const db = getDb();
+  const rows = db.prepare(
+    `SELECT
+       runs.id,
+       runs.project_id,
+       runs.status,
+       runs.started_at,
+       runs.ended_at,
+       repositories.path AS repo_path
+     FROM runs
+     INNER JOIN projects ON projects.id = runs.project_id
+     LEFT JOIN repositories ON repositories.id = projects.repository_id
+     WHERE runs.status IN ('running', 'failed')
+     ORDER BY runs.started_at ASC`
+  ).all() as Array<{
+    id: string;
+    project_id: string;
+    status: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    repo_path?: string | null;
+  }>;
+  const touchedProjectIds = new Set(rows.map((row) => row.project_id));
+
+  for (const row of rows) {
+    const rowEndedAt = row.ended_at ?? endedAt;
+    const recovery = recoverInterruptedRunArtifacts(row.project_id, row.id, row.repo_path, row.started_at, rowEndedAt);
+    if (recovery.recovered) {
+      const message = `${RECOVERED_INTERRUPTED_RUN_MESSAGE} (${recovery.artifactCount} artifacts)`;
+      db.prepare(
+        `UPDATE run_steps
+         SET status = 'completed', ended_at = COALESCE(ended_at, ?), error_message = ?
+         WHERE run_id = ? AND status IN ('running', 'failed')`
+      ).run(rowEndedAt, message, row.id);
+      db.prepare(
+        `UPDATE runs
+         SET status = 'completed', ended_at = COALESCE(ended_at, ?), error_message = ?
+         WHERE id = ?`
+      ).run(rowEndedAt, message, row.id);
+      db.prepare("UPDATE projects SET status = 'completed', updated_at = ? WHERE id = ?").run(rowEndedAt, row.project_id);
+      continue;
+    }
+
+    if (row.status === "running") {
+      db.prepare(
+        `UPDATE run_steps
+         SET status = 'failed', ended_at = COALESCE(ended_at, ?), error_message = COALESCE(error_message, ?)
+         WHERE run_id = ? AND status = 'running'`
+      ).run(rowEndedAt, INTERRUPTED_RUN_FAILED_MESSAGE, row.id);
+      db.prepare(
+        `UPDATE runs
+         SET status = 'failed', ended_at = COALESCE(ended_at, ?), error_message = COALESCE(error_message, ?)
+         WHERE id = ?`
+      ).run(rowEndedAt, INTERRUPTED_RUN_FAILED_MESSAGE, row.id);
+    }
+    db.prepare("UPDATE projects SET status = 'failed', updated_at = ? WHERE id = ?").run(rowEndedAt, row.project_id);
+  }
+
+  for (const projectId of touchedProjectIds) {
+    syncProjectStatusFromLatestRun(projectId, endedAt);
+  }
+}
+
+function cleanupInterruptedRunsLegacy() {
   const endedAt = nowIso();
   const db = getDb();
   db.prepare(
@@ -85,11 +198,112 @@ export function cleanupInterruptedRuns() {
   ).run(endedAt);
 }
 
+function recoverInterruptedRunArtifacts(
+  projectId: string,
+  runId: string,
+  repoPath: string | null | undefined,
+  startedAtValue: string | null | undefined,
+  endedAtValue: string | null | undefined
+) {
+  if (!repoPath || !existsSync(repoPath) || !startedAtValue) return { recovered: false, artifactCount: 0 };
+  const startedAt = new Date(startedAtValue);
+  if (Number.isNaN(startedAt.getTime())) return { recovered: false, artifactCount: 0 };
+  const endedAt = endedAtValue ? new Date(endedAtValue) : null;
+  try {
+    rescanArtifacts(projectId, runId);
+  } catch {
+    return { recovered: false, artifactCount: 0 };
+  }
+  const artifactCount = countRecoverableRunArtifacts(runId);
+  const producedResearchArtifact = artifactCount > 0 || hasRecoverableArtifact(repoPath, startedAt, endedAt);
+  return { recovered: producedResearchArtifact, artifactCount };
+}
+
+function countRecoverableRunArtifacts(runId: string) {
+  const rows = getDb().prepare("SELECT name FROM artifacts WHERE run_id = ?").all(runId) as Array<{ name: string }>;
+  return rows.filter((row) => isCompletionArtifactName(row.name)).length;
+}
+
+function isCompletionArtifactName(name: string) {
+  const normalized = name.replace(/\\/g, "/");
+  const base = path.basename(normalized);
+  if (NON_COMPLETION_ARTIFACT_NAMES.has(base)) return false;
+  if (normalized.startsWith(".aris-app/")) return false;
+  return true;
+}
+
+function hasRecoverableArtifact(repoPath: string, startedAt: Date, endedAt: Date | null) {
+  const lowerBound = new Date(startedAt);
+  lowerBound.setSeconds(lowerBound.getSeconds() - 2);
+  const upperBound = endedAt && !Number.isNaN(endedAt.getTime()) ? new Date(endedAt) : null;
+  if (upperBound) upperBound.setSeconds(upperBound.getSeconds() + 2);
+  for (const artifactPath of CORE_ARTIFACTS) {
+    const fullPath = path.join(repoPath, artifactPath);
+    if (isChangedRecoverableFile(fullPath, repoPath, lowerBound, upperBound)) return true;
+  }
+  return scanRecoverableArtifacts(repoPath, repoPath, lowerBound, upperBound);
+}
+
+function scanRecoverableArtifacts(root: string, repoPath: string, lowerBound: Date, upperBound: Date | null): boolean {
+  if (!existsSync(root)) return false;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (RECOVERABLE_IGNORED_DIRS.has(entry.name)) continue;
+      const relRoot = path.relative(repoPath, full).replace(/\\/g, "/").split("/")[0] ?? "";
+      if (!RECOVERABLE_ARTIFACT_ROOTS.has(relRoot)) continue;
+      if (scanRecoverableArtifacts(full, repoPath, lowerBound, upperBound)) return true;
+      continue;
+    }
+    if (isChangedRecoverableFile(full, repoPath, lowerBound, upperBound)) return true;
+  }
+  return false;
+}
+
+function isChangedRecoverableFile(filePath: string, repoPath: string, lowerBound: Date, upperBound: Date | null) {
+  const rel = path.relative(repoPath, filePath).replace(/\\/g, "/");
+  const root = rel.includes("/") ? rel.split("/")[0] : "";
+  if (!RECOVERABLE_ARTIFACT_ROOTS.has(root)) return false;
+  if (!isCompletionArtifactName(rel)) return false;
+  if (!isResearchArtifactExtension(filePath)) return false;
+  const mtime = statMtime(filePath);
+  if (mtime < lowerBound) return false;
+  if (upperBound && mtime > upperBound) return false;
+  return true;
+}
+
+function isResearchArtifactExtension(filePath: string) {
+  return [".md", ".pdf", ".docx", ".doc", ".json", ".jsonl", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".tex", ".csv", ".html", ".htm", ".txt"].includes(
+    path.extname(filePath).toLowerCase()
+  );
+}
+
+function syncProjectStatusFromLatestRun(projectId: string, fallbackUpdatedAt: string) {
+  const row = getDb()
+    .prepare(
+      `SELECT runs.status, runs.started_at, runs.ended_at, projects.repository_id
+       FROM projects
+       LEFT JOIN runs ON runs.project_id = projects.id
+       WHERE projects.id = ?
+       ORDER BY runs.started_at DESC
+       LIMIT 1`
+    )
+    .get(projectId) as { status?: string | null; started_at?: string | null; ended_at?: string | null; repository_id?: string | null } | undefined;
+  if (!row) return;
+  const status = row.status && ["completed", "failed", "running", "waiting_approval"].includes(row.status)
+    ? row.status
+    : row.repository_id
+      ? "ready"
+      : "draft";
+  getDb().prepare("UPDATE projects SET status = ?, updated_at = ? WHERE id = ?").run(status, row.ended_at ?? row.started_at ?? fallbackUpdatedAt, projectId);
+}
+
 export async function startRun(input: StartRunInput): Promise<Run> {
   const project = getProject(input.projectId);
   if (!project.repository?.path) throw new Error("项目尚未绑定 Git 仓库");
   const executor = getExecutor(input.executorId ?? project.defaultExecutorId ?? "executor-codex");
-  const workflowType = input.workflowType;
+  const workflowType = (input.launchConfig?.workflowType ?? input.workflowType) as WorkflowType;
+  const topic = input.launchConfig?.topic?.trim() || input.topic || project.topic;
   const runId = id("run");
   const stepId = id("step");
   const startedAt = nowIso();
@@ -104,20 +318,39 @@ export async function startRun(input: StartRunInput): Promise<Run> {
   writeFileSync(stderrPath, "", "utf8");
   writeFileSync(eventsPath, "", "utf8");
   writeFileSync(progressPath, "", "utf8");
-  writeResearchBrief(project.repository.path, workflowType, input.topic ?? project.topic, runId);
+  writeResearchBrief(project.repository.path, workflowType, topic, runId, input.launchConfig ?? undefined);
 
   const gitBefore = await readGitStatus(project.repository.path).catch((error) => ({ error: String(error) }));
   writeFileSync(path.join(runDir, "git-before.json"), JSON.stringify(gitBefore, null, 2), "utf8");
 
-  const commandPlan = buildWorkflowCommandPlan(executor, workflowType, input.topic ?? project.topic, project.repository.path);
-  const args = commandPlan[0];
-  const command = executor.executablePath;
+  const commandPlan = buildWorkflowCommandPlan(executor, workflowType, topic, project.repository.path, input.continuationPrompt ?? undefined, input.launchConfig ?? undefined, input.extraPrompt ?? undefined, input.promptOverride ?? undefined);
+  const firstAttempt = commandPlan[0];
+  const args = firstAttempt.args;
+  const command = executor.kind === "codex-cli" ? normalizeCodexExecutablePath(executor.executablePath) : executor.executablePath;
   const hardIdleTimeoutMs = parsePositiveInt(executor.env?.ARIS_HARD_IDLE_TIMEOUT_MS, DEFAULT_HARD_IDLE_TIMEOUT_MS);
   const db = getDb();
   db.prepare(
-    `INSERT INTO runs (id, project_id, workflow_template_id, executor_id, status, current_node_id, round_index, started_at)
-    VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`
-  ).run(runId, project.id, project.defaultWorkflowId ?? null, executor.id, stepId, project.runCount + 1, startedAt);
+    `INSERT INTO runs (
+      id, project_id, workflow_template_id, workflow_type, executor_id, status, current_node_id,
+      round_index, parent_run_id, continuation_index, continuation_reason,
+      launch_config_json, extra_prompt, prompt_override, started_at
+    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    runId,
+    project.id,
+    project.defaultWorkflowId ?? null,
+    workflowType,
+    executor.id,
+    stepId,
+    project.runCount + 1,
+    input.parentRunId ?? null,
+    input.continuationIndex ?? 0,
+    input.continuationReason ?? null,
+    input.launchConfig ? JSON.stringify(input.launchConfig) : null,
+    input.extraPrompt ?? null,
+    input.promptOverride ?? null,
+    startedAt
+  );
   db.prepare(
     `INSERT INTO run_steps (id, run_id, status, command, args_json, stdout_path, stderr_path, started_at)
     VALUES (?, ?, 'running', ?, ?, ?, ?, ?)`
@@ -131,7 +364,7 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     emit(runDir, { runId, stepId, type: "stderr", message: `Codex model plan: ${describeModelPlan(commandPlan)}`, timestamp: nowIso() });
   }
 
-  let activeChild = startChild(command, args, project.repository.path, executor.env, executor.kind === "codex-cli");
+  let activeChild = startChild(command, args, project.repository.path, executor.env, executor.kind === "codex-cli", firstAttempt.stdinText);
   running.set(runId, activeChild);
   let lastOutputAt = Date.now();
   let softIdleWarningSent = false;
@@ -174,7 +407,7 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     }
     activeChild.kill("SIGTERM");
     const idleMessage = `Executor produced no output for ${Math.round(hardIdleTimeoutMs / 1000)} seconds and no core artifact was found; stopped.`;
-    ensureFallbackArtifact(project.repository!.path, runId, workflowType, input.topic ?? project.topic, null, idleMessage);
+    ensureFallbackArtifact(project.repository!.path, runId, workflowType, topic, null, idleMessage);
     emit(runDir, {
       runId,
       stepId,
@@ -184,34 +417,53 @@ export async function startRun(input: StartRunInput): Promise<Run> {
     });
     clearInterval(idleTimer);
   }, 15000);
-  const attachStreams = (activeChild: ReturnType<typeof startChild>) => {
+  const attachStreams = (activeChild: ReturnType<typeof startChild>, activeArgs: string[]) => {
     activeChild.stdout?.on("data", (chunk: Buffer) => {
       lastOutputAt = Date.now();
       const message = decodeTextBuffer(chunk);
       appendFileSync(stdoutPath, message, "utf8");
+      if (executor.kind === "codex-cli") {
+        recordUsageFromText({
+          projectId: project.id,
+          runId,
+          source: "run",
+          model: modelFromArgs(activeArgs),
+          reasoningEffort: reasoningEffortFromExecutor(executor, input.launchConfig)
+        }, message);
+      }
       emit(runDir, { runId, stepId, type: "stdout", message: redact(message), timestamp: nowIso() });
     });
     activeChild.stderr?.on("data", (chunk: Buffer) => {
       lastOutputAt = Date.now();
       const message = decodeTextBuffer(chunk);
       appendFileSync(stderrPath, message, "utf8");
+      if (executor.kind === "codex-cli") {
+        recordUsageFromText({
+          projectId: project.id,
+          runId,
+          source: "run",
+          model: modelFromArgs(activeArgs),
+          reasoningEffort: reasoningEffortFromExecutor(executor, input.launchConfig)
+        }, message);
+      }
       emit(runDir, { runId, stepId, type: "stderr", message: redact(message), timestamp: nowIso() });
     });
   };
-  attachStreams(activeChild);
+  attachStreams(activeChild, args);
   activeChild
     .then(async (firstResult) => {
       let result = firstResult;
       let attemptIndex = 1;
       while (shouldRetryForModelCapacity(result.stderr || result.stdout) && attemptIndex < commandPlan.length) {
-        const nextArgs = commandPlan[attemptIndex];
+        const nextAttempt = commandPlan[attemptIndex];
+        const nextArgs = nextAttempt.args;
         const retryMessage = `Model capacity is unavailable; retrying with fallback arguments: ${redact([command, ...nextArgs].join(" "))}`;
         appendFileSync(stderrPath, `${retryMessage}\n`, "utf8");
         emit(runDir, { runId, stepId, type: "stderr", message: retryMessage, timestamp: nowIso() });
         db.prepare("UPDATE run_steps SET args_json = ? WHERE id = ?").run(JSON.stringify(nextArgs), stepId);
-        activeChild = startChild(command, nextArgs, project.repository!.path, executor.env, executor.kind === "codex-cli");
+        activeChild = startChild(command, nextArgs, project.repository!.path, executor.env, executor.kind === "codex-cli", nextAttempt.stdinText);
         running.set(runId, activeChild);
-        attachStreams(activeChild);
+        attachStreams(activeChild, nextArgs);
         result = await activeChild;
         attemptIndex += 1;
       }
@@ -222,15 +474,15 @@ export async function startRun(input: StartRunInput): Promise<Run> {
       const endedAt = nowIso();
       const gitAfter = await readGitStatus(project.repository!.path).catch((error) => ({ error: String(error) }));
       writeFileSync(path.join(runDir, "git-after.json"), JSON.stringify(gitAfter, null, 2), "utf8");
-      ensureFallbackArtifact(project.repository!.path, runId, workflowType, input.topic ?? project.topic, result.exitCode ?? null, result.stderr || result.stdout || "");
+      ensureFallbackArtifact(project.repository!.path, runId, workflowType, topic, result.exitCode ?? null, result.stderr || result.stdout || "");
       if (shouldRunMultiAgentPaperReview(workflowType)) {
-        await runMultiAgentPaperReview(project.repository!.path, runDir, runId, stepId, input.topic ?? project.topic);
+        await runMultiAgentPaperReview(project.repository!.path, runDir, runId, stepId, topic, input.launchConfig);
       }
       const artifacts = rescanArtifacts(project.id, runId);
       const producedCoreArtifact = hasCoreArtifact(project.repository!.path, runStartedAt);
       const status = result.exitCode === 0 || producedCoreArtifact ? "completed" : "failed";
       if (producedCoreArtifact) emitArtifactSummary(project.repository!.path, runDir, runId, stepId, runStartedAt);
-      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt));
+      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt), input.launchConfig);
       const errorMessage =
         result.exitCode === 0
           ? null
@@ -276,19 +528,31 @@ export async function startRun(input: StartRunInput): Promise<Run> {
         agentName: "ARIS Paper Studio",
         timestamp: endedAt
       }, stepId);
+      await maybeAutoContinueRun({
+        projectId: project.id,
+        runId,
+        workflowType,
+        executorId: executor.id,
+        topic,
+        status,
+        exitCode: result.exitCode ?? null,
+        errorMessage,
+        continuationIndex: input.continuationIndex ?? 0,
+        launchConfig: input.launchConfig ?? null
+      });
     })
-    .catch((error) => {
+    .catch(async (error) => {
       running.delete(runId);
       progressWatcher.close();
       clearInterval(idleTimer);
       const endedAt = nowIso();
       const message = error instanceof Error ? error.message : String(error);
-      ensureFallbackArtifact(project.repository!.path, runId, workflowType, input.topic ?? project.topic, null, message);
+      ensureFallbackArtifact(project.repository!.path, runId, workflowType, topic, null, message);
       const artifacts = rescanArtifacts(project.id, runId);
       const producedCoreArtifact = hasCoreArtifact(project.repository!.path, runStartedAt);
       const status = producedCoreArtifact ? "completed" : "failed";
       if (producedCoreArtifact) emitArtifactSummary(project.repository!.path, runDir, runId, stepId, runStartedAt);
-      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt));
+      emitQualityRiskIfNeeded(project.repository!.path, runDir, runId, stepId, workflowType, runStartedAt, new Date(endedAt), input.launchConfig);
       const errorMessage = producedCoreArtifact
         ? "Executor failed before normal exit, but a fallback artifact was produced."
         : message;
@@ -314,6 +578,18 @@ export async function startRun(input: StartRunInput): Promise<Run> {
         agentName: "ARIS Paper Studio",
         timestamp: endedAt
       }, stepId);
+      await maybeAutoContinueRun({
+        projectId: project.id,
+        runId,
+        workflowType,
+        executorId: executor.id,
+        topic,
+        status,
+        exitCode: null,
+        errorMessage,
+        continuationIndex: input.continuationIndex ?? 0,
+        launchConfig: input.launchConfig ?? null
+      });
     });
 
   return getRun(runId);
@@ -337,7 +613,157 @@ export async function stopRun(runId: string) {
   }
 }
 
-function startChild(command: string, args: string[], cwd: string, env?: Record<string, string>, syncCodexModelEnv = false) {
+export async function continueRun(runId: string, input: ContinueRunInput = {}): Promise<Run> {
+  const row = getDb().prepare("SELECT * FROM runs WHERE id = ?").get(runId) as any;
+  if (!row) throw new Error("运行记录不存在");
+  const project = getProject(row.project_id);
+  const workflowType = (input.launchConfig?.workflowType ?? row.workflow_type ?? "research-pipeline") as WorkflowType;
+  const nextIndex = (row.continuation_index ?? 0) + 1;
+  const reason = "manual";
+  const chain = findOrCreateChain(project.id, "run", runId);
+  const continuationPrompt = joinPromptParts(
+    buildRunContinuationPrompt(runId, "用户手动续接"),
+    input.extraPrompt?.trim() ? `## 用户本轮续接干预\n\n${input.extraPrompt.trim()}` : ""
+  );
+  const next = await startRun({
+    projectId: project.id,
+    workflowType,
+    executorId: row.executor_id ?? project.defaultExecutorId ?? "executor-codex",
+    topic: input.launchConfig?.topic?.trim() || project.topic,
+    parentRunId: runId,
+    continuationIndex: nextIndex,
+    continuationReason: reason,
+    continuationPrompt,
+    launchConfig: input.launchConfig ?? parseJson<WorkflowLaunchConfig | null>(row.launch_config_json, null),
+    extraPrompt: input.extraPrompt ?? null,
+    promptOverride: input.promptOverride ?? null
+  });
+  recordContinuationEvent({
+    chainId: chain.id,
+    projectId: project.id,
+    itemType: "run",
+    itemId: next.id,
+    parentItemId: runId,
+    continuationIndex: nextIndex,
+    reason,
+    status: "started",
+    summary: "用户手动续接 Workflow"
+  });
+  return next;
+}
+
+async function maybeAutoContinueRun(input: {
+  projectId: string;
+  runId: string;
+  workflowType: WorkflowType;
+  executorId: string;
+  topic: string;
+  status: Run["status"];
+  exitCode: number | null;
+  errorMessage?: string | null;
+  continuationIndex: number;
+  launchConfig?: WorkflowLaunchConfig | null;
+}) {
+  const reasonKey = continuationReasonFromRun(input.status, input.exitCode, input.errorMessage);
+  if (!reasonKey) return;
+  const nextIndex = input.continuationIndex + 1;
+  if (input.launchConfig?.autoContinueEnabled === false) {
+    const chain = findOrCreateChain(input.projectId, "run", input.runId);
+    recordContinuationEvent({
+      chainId: chain.id,
+      projectId: input.projectId,
+      itemType: "run",
+      itemId: input.runId,
+      parentItemId: null,
+      continuationIndex: input.continuationIndex,
+      reason: reasonKey,
+      status: "skipped",
+      summary: "本轮配置已关闭自动续接"
+    });
+    return;
+  }
+  if (input.launchConfig?.maxContinuations && nextIndex > input.launchConfig.maxContinuations) {
+    const chain = findOrCreateChain(input.projectId, "run", input.runId);
+    markContinuationStopped(chain.id, "已达到本轮配置的最大续接次数");
+    recordContinuationEvent({
+      chainId: chain.id,
+      projectId: input.projectId,
+      itemType: "run",
+      itemId: input.runId,
+      parentItemId: null,
+      continuationIndex: input.continuationIndex,
+      reason: reasonKey,
+      status: "stopped",
+      summary: "已达到本轮配置的最大续接次数"
+    });
+    return;
+  }
+  const noArtifactStopReason = consecutiveNoArtifactStopReason(input.runId);
+  if (noArtifactStopReason) {
+    const chain = findOrCreateChain(input.projectId, "run", input.runId);
+    markContinuationStopped(chain.id, noArtifactStopReason);
+    recordContinuationEvent({
+      chainId: chain.id,
+      projectId: input.projectId,
+      itemType: "run",
+      itemId: input.runId,
+      parentItemId: null,
+      continuationIndex: input.continuationIndex,
+      reason: reasonKey,
+      status: "stopped",
+      summary: noArtifactStopReason
+    });
+    return;
+  }
+  const decision = canStartContinuation(input.projectId, "run", input.runId, nextIndex, reasonKey);
+  if (!decision.ok || !decision.chain) {
+    const chain = findOrCreateChain(input.projectId, "run", input.runId);
+    recordContinuationEvent({
+      chainId: chain.id,
+      projectId: input.projectId,
+      itemType: "run",
+      itemId: input.runId,
+      parentItemId: null,
+      continuationIndex: input.continuationIndex,
+      reason: reasonKey,
+      status: chain.stopped ? "stopped" : "skipped",
+      summary: decision.reason
+    });
+    return;
+  }
+  const next = await startRun({
+    projectId: input.projectId,
+    workflowType: input.workflowType,
+    executorId: input.executorId,
+    topic: input.topic,
+    parentRunId: input.runId,
+    continuationIndex: nextIndex,
+    continuationReason: reasonKey,
+    continuationPrompt: buildRunContinuationPrompt(input.runId, reasonKey),
+    launchConfig: input.launchConfig ?? null
+  });
+  recordContinuationEvent({
+    chainId: decision.chain.id,
+    projectId: input.projectId,
+    itemType: "run",
+    itemId: next.id,
+    parentItemId: input.runId,
+    continuationIndex: nextIndex,
+    reason: reasonKey,
+    status: "started",
+    summary: `自动续接 Workflow：${reasonKey}`
+  });
+}
+
+function consecutiveNoArtifactStopReason(runId: string) {
+  if (countRecoverableRunArtifacts(runId) > 0) return "";
+  const row = getDb().prepare("SELECT parent_run_id FROM runs WHERE id = ?").get(runId) as { parent_run_id?: string | null } | undefined;
+  if (!row?.parent_run_id) return "";
+  if (countRecoverableRunArtifacts(row.parent_run_id) > 0) return "";
+  return "连续两段没有新增有效产物，自动续接已停止";
+}
+
+function startChild(command: string, args: string[], cwd: string, env?: Record<string, string>, syncCodexModelEnv = false, stdinText?: string) {
   const childEnv = { ...process.env, ...UTF8_PROCESS_ENV, ...(env ?? {}) };
   if (syncCodexModelEnv) {
     const modelFlagIndex = args.indexOf("-m");
@@ -347,23 +773,25 @@ function startChild(command: string, args: string[], cwd: string, env?: Record<s
       delete childEnv.OPENAI_MODEL;
     }
   }
-  return execa(command, args, {
+  const child = execa(command, args, {
     cwd,
     env: childEnv,
-    stdin: "ignore",
+    stdin: stdinText ? "pipe" : "ignore",
     reject: false,
     all: false
   });
+  if (stdinText) child.stdin?.end(`${stdinText}\n`);
+  return child;
 }
 
 function shouldRunMultiAgentPaperReview(workflowType: WorkflowType) {
   return workflowType === "research-pipeline" || workflowType === "paper-writing" || workflowType === "multi-agent-paper-review";
 }
 
-async function runMultiAgentPaperReview(repoPath: string, runDir: string, runId: string, stepId: string, topic: string) {
+async function runMultiAgentPaperReview(repoPath: string, runDir: string, runId: string, stepId: string, topic: string, launchConfig?: WorkflowLaunchConfig | null) {
   const reviewDir = path.join(repoPath, "review-stage");
   const summaryPath = path.join(reviewDir, "MULTI_AGENT_REVIEW.md");
-  if (existsSync(summaryPath)) {
+  if (existsSync(summaryPath) && !launchConfig?.rerunExistingReview) {
     emitInsight(runDir, {
       runId,
       stageKey: "multi-agent-paper-review",
@@ -398,12 +826,11 @@ async function runMultiAgentPaperReview(repoPath: string, runDir: string, runId:
   const executor = getExecutor("executor-codex");
   const results = await Promise.all(reviewers.map(async (reviewer) => {
     const prompt = buildReviewerPrompt(topic, reviewer.name, reviewer.focus, path.join("review-stage", reviewer.file));
-    const result = await execa(executor.executablePath, ["exec", "-C", repoPath, "--skip-git-repo-check", "--sandbox", "workspace-write", prompt], {
-      cwd: repoPath,
-      env: { ...UTF8_PROCESS_ENV, ...(executor.env ?? {}) },
-      reject: false,
-      timeout: 300000
-    }).catch((error) => ({ exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) }));
+    const command = normalizeCodexExecutablePath(executor.executablePath);
+    const child = startChild(command, ["exec", "-C", repoPath, "--skip-git-repo-check", "--sandbox", "workspace-write", "-"], repoPath, executor.env, false, prompt);
+    const timeout = setTimeout(() => child.kill("SIGTERM"), 300000);
+    const result = await child.catch((error) => ({ exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) }));
+    clearTimeout(timeout);
     return { reviewer, result };
   }));
   const failures = results.filter((item) => item.result.exitCode !== 0);
@@ -508,52 +935,81 @@ function buildWorkflowCommandPlan(
   executor: ReturnType<typeof getExecutor>,
   workflowType: WorkflowType,
   topic: string,
-  repoPath: string
-) {
+  repoPath: string,
+  continuationPrompt?: string,
+  launchConfig?: WorkflowLaunchConfig | null,
+  extraPrompt?: string | null,
+  promptOverride?: string | null
+): CommandAttempt[] {
   if (executor.kind === "codex-cli") {
+    const stdinText = buildWorkflowPromptForPreview({ workflowType, topic, continuationPrompt, launchConfig, extraPrompt, promptOverride });
     const makeArgs = (model?: string) => {
-      const args = ["exec", "-C", repoPath, "--skip-git-repo-check"];
-      const sandbox = executor.env?.CODEX_SANDBOX_MODE || "danger-full-access";
-      const approval = executor.env?.CODEX_APPROVAL_MODE || "never";
+      const args = ["exec", "-C", repoPath, "--skip-git-repo-check", "--json", "--color", "never"];
+      const sandbox = launchConfig?.sandbox?.trim() || executor.env?.CODEX_SANDBOX_MODE || "danger-full-access";
+      const approval = launchConfig?.approval?.trim() || executor.env?.CODEX_APPROVAL_MODE || "never";
       if (sandbox === "danger-full-access" && approval === "never") {
         args.push("--dangerously-bypass-approvals-and-sandbox");
       } else {
         args.push("--sandbox", sandbox);
       }
       if (model) args.push("-m", model);
-      args.push(buildCodexWorkflowPrompt(workflowType, topic));
+      args.push("-c", `model_reasoning_effort="${reasoningEffortFromExecutor(executor, launchConfig)}"`);
+      args.push("-");
       return args;
     };
-    const configuredModel = executor.env?.OPENAI_MODEL?.trim();
+    const configuredModel = launchConfig?.model?.trim() || executor.env?.OPENAI_MODEL?.trim();
     const configuredFallbacks = parseModelList(executor.env?.OPENAI_FALLBACK_MODELS);
     const fallbackModels = configuredFallbacks.length ? configuredFallbacks : DEFAULT_FALLBACK_MODELS;
-    const shouldUseConfiguredModel = configuredModel && !["auto", "default", "gpt-5.4"].includes(configuredModel.toLowerCase());
-    const modelPlan = dedupeModels([undefined, ...fallbackModels, shouldUseConfiguredModel ? configuredModel : undefined]);
-    return modelPlan.map((item) => makeArgs(item));
+    const primaryModel = configuredModel && !["auto", "default"].includes(configuredModel.toLowerCase()) ? configuredModel : DEFAULT_PRIMARY_MODEL;
+    const modelPlan = dedupeModels([primaryModel, ...fallbackModels]);
+    return modelPlan.map((item) => ({ args: makeArgs(item), stdinText }));
   }
   if (executor.kind === "aris-code") {
-    return [[workflowType, topic, "--auto-proceed"]];
+    return [{ args: [workflowType, topic, "--auto-proceed"] }];
   }
   if (executor.kind === "claude-code") {
-    return [[`/${workflowType} "${topic}" --auto proceed: true`]];
+    return [{ args: [`/${workflowType} "${topic}" --auto proceed: true`] }];
   }
   if (executor.defaultArgs.length > 0 && !executor.defaultArgs.includes("--help") && !executor.defaultArgs.includes("--version")) {
-    return [executor.defaultArgs];
+    return [{ args: executor.defaultArgs }];
   }
-  return [[workflowType, topic, "--auto-proceed"]];
+  return [{ args: [workflowType, topic, "--auto-proceed"] }];
 }
 
-function describeModelPlan(commandPlan: string[][]) {
+function describeModelPlan(commandPlan: CommandAttempt[]) {
   return commandPlan
-    .map((args) => {
-      const modelIndex = args.indexOf("-m");
-      return modelIndex >= 0 && args[modelIndex + 1] ? args[modelIndex + 1] : "auto";
+    .map((attempt) => {
+      const modelIndex = attempt.args.indexOf("-m");
+      return modelIndex >= 0 && attempt.args[modelIndex + 1] ? attempt.args[modelIndex + 1] : "auto";
     })
     .join(" -> ");
 }
 
-function buildCodexWorkflowPrompt(workflowType: WorkflowType, topic: string) {
-  const qualityBudget = qualityBudgetFor(workflowType);
+function modelFromArgs(args: string[]) {
+  const modelIndex = args.indexOf("-m");
+  return modelIndex >= 0 && args[modelIndex + 1] ? args[modelIndex + 1] : DEFAULT_PRIMARY_MODEL;
+}
+
+function reasoningEffortFromExecutor(executor: ReturnType<typeof getExecutor>, launchConfig?: WorkflowLaunchConfig | null) {
+  const value = launchConfig?.reasoningEffort?.trim() || executor.env?.CODEX_REASONING_EFFORT?.trim() || executor.env?.OPENAI_REASONING_EFFORT?.trim() || DEFAULT_REASONING_EFFORT;
+  return ["low", "medium", "high", "xhigh"].includes(value) ? value : DEFAULT_REASONING_EFFORT;
+}
+
+export function buildWorkflowPromptForPreview(input: WorkflowPromptBuildInput) {
+  if (input.promptOverride?.trim()) return input.promptOverride.trim();
+  return buildCodexWorkflowPrompt(input.workflowType, input.topic, input.continuationPrompt, input.launchConfig, input.extraPrompt);
+}
+
+function joinPromptParts(...parts: Array<string | null | undefined>) {
+  return parts
+    .map((part) => part?.trim())
+    .filter((part): part is string => Boolean(part))
+    .join("\n\n");
+}
+
+function buildCodexWorkflowPrompt(workflowType: WorkflowType, topic: string, continuationPrompt?: string, launchConfig?: WorkflowLaunchConfig | null, extraPrompt?: string | null) {
+  const qualityBudget = qualityBudgetFor(workflowType, launchConfig);
+  const pdfCompileGuidance = buildPdfCompileGuidance(workflowType, launchConfig);
   return appendUtf8Guidance([
     `请在当前仓库中执行 ARIS workflow：/${workflowType}`,
     `研究主题：${topic}`,
@@ -563,6 +1019,7 @@ function buildCodexWorkflowPrompt(workflowType: WorkflowType, topic: string) {
     "运行可视化要求：每完成一个关键阶段，向 .aris-app/runs 目录下最新 run 的 progress.zh.jsonl 追加一行 JSON，字段为 stageKey、title、status、bullets、blockers、nextActions、agentName、timestamp。bullets、blockers、nextActions 必须是中文数组。",
     "运行可视化约束：只在真实进入、完成、受阻或失败某个阶段时写 progress.zh.jsonl；不要提前写未来阶段的 pending 记录，也不要伪造尚未发生的阶段。",
     "完整论文生成要求：如果 workflow 是 /research-pipeline，请按顺序推进：idea-discovery、写作前 auto-review-loop、experiment-bridge、paper-plan、paper-write、paper-compile、成稿后 multi-agent-paper-review。",
+    pdfCompileGuidance,
     "成稿后 multi-agent-paper-review 要求：默认模拟或调用 3 个评审 agent，分别负责创新性、实验可信度、写作/投稿适配；每个 agent 输出中文分报告和 0-10 分，最后生成 review-stage/MULTI_AGENT_REVIEW.md，包含总分、分项分、主要拒稿风险、必须修改项、可选增强项。",
     `质量预算要求：本次任务属于“${qualityBudget.label}”，不要用几段占位文字快速结束。除非仓库已有充分成果可复用，否则应进行接近 ${Math.round(qualityBudget.minMs / 60000)} 分钟量级的阅读、分析、比较、写作或评审，并产出至少约 ${qualityBudget.minMarkdownChars} 个中文 Markdown 字符的实质内容。`,
     "如果你因为模型、环境或资料不足无法深入推进，请明确写出阻塞原因和已完成工作，不要伪装成完整论文生成已经完成。",
@@ -572,12 +1029,26 @@ function buildCodexWorkflowPrompt(workflowType: WorkflowType, topic: string) {
     "3. 如果可以继续推进，请生成阶段性中文报告、日志、LaTeX 或 PDF 产物，并写入当前仓库中的合理位置。",
     "4. 如果当前环境缺少某个外部工具，先用中文记录清楚缺失项，并产出可检查的 Markdown 报告。",
     "5. 不要执行 destructive Git 命令，不要自动 commit 或 push。",
-    "6. 不要长时间只读取旧日志；如果需要参考运行记录，只读最近一次 run 的摘要即可。"
+    "6. 不要长时间只读取旧日志；如果需要参考运行记录，只读最近一次 run 的摘要即可。",
+    launchConfig?.rerunExistingReview ? "7. 本轮用户允许重跑已有成稿后多 Agent 评审；如需重跑，请先说明为何需要覆盖旧评审。" : "",
+    extraPrompt?.trim() ? "\n## 用户本轮附加干预\n\n" + extraPrompt.trim() : "",
+    continuationPrompt ? "\n## 自动续接交接摘要\n\n" + continuationPrompt : ""
   ]).join("\n");
 }
 
-function writeResearchBrief(repoPath: string, workflowType: WorkflowType, topic: string, runId: string) {
-  const qualityBudget = qualityBudgetFor(workflowType);
+function buildPdfCompileGuidance(workflowType: WorkflowType, launchConfig?: WorkflowLaunchConfig | null) {
+  const mode = launchConfig?.pdfCompileMode ?? "codex-skill-first";
+  if (mode === "local-latex-first") {
+    return "论文 PDF 编译要求：进入 paper-compile 阶段时，可以优先使用本地 LaTeX 工具链生成或修复 `paper/paper.pdf`；如果本地工具链缺失，请写入中文报告说明缺失项。";
+  }
+  if (workflowType === "paper-compile") {
+    return "本次任务只做 paper-compile：请优先调用已安装的 `paper-compile` skill 生成或修复 `paper/paper.pdf`，不要重跑完整 research-pipeline。若 skill 不存在，再退回本地 LaTeX 工具链，并在 `paper/PDF_COMPILE_REPORT.zh.md` 中说明缺失原因、执行命令、错误和后续修复建议。";
+  }
+  return "论文 PDF 编译要求：进入 paper-compile 阶段时，优先调用已安装的 `paper-compile` skill 生成或修复 `paper/paper.pdf`。若 skill 不存在，再退回本地 LaTeX 工具链，并在报告中写明缺失原因、执行命令和修复建议。";
+}
+
+function writeResearchBrief(repoPath: string, workflowType: WorkflowType, topic: string, runId: string, launchConfig?: WorkflowLaunchConfig | null) {
+  const qualityBudget = qualityBudgetFor(workflowType, launchConfig);
   const brief = appendUtf8Guidance([
     "# Research Brief",
     "",
@@ -725,6 +1196,7 @@ function canonicalStagesFor(workflowType: WorkflowType) {
     return ["idea-discovery", "auto-review-loop", "experiment-bridge", "paper-plan", "paper-write", "paper-compile", "multi-agent-paper-review"];
   }
   if (workflowType === "paper-writing") return ["paper-plan", "paper-write", "paper-compile", "multi-agent-paper-review"];
+  if (workflowType === "paper-compile") return ["paper-compile"];
   if (workflowType === "multi-agent-paper-review") return ["multi-agent-paper-review"];
   return [];
 }
@@ -904,9 +1376,10 @@ function emitQualityRiskIfNeeded(
   stepId: string,
   workflowType: WorkflowType,
   startedAt: Date,
-  endedAt: Date
+  endedAt: Date,
+  launchConfig?: WorkflowLaunchConfig | null
 ) {
-  const budget = qualityBudgetFor(workflowType);
+  const budget = qualityBudgetFor(workflowType, launchConfig);
   const elapsedMs = endedAt.getTime() - startedAt.getTime();
   const markdownChars = countChangedMarkdownChars(repoPath, startedAt);
   const risks: string[] = [];
@@ -930,8 +1403,13 @@ function emitQualityRiskIfNeeded(
   }, stepId);
 }
 
-function qualityBudgetFor(workflowType: WorkflowType) {
-  return QUALITY_BUDGETS[workflowType] ?? { minMs: 2 * 60 * 1000, minMarkdownChars: 1500, label: workflowType };
+function qualityBudgetFor(workflowType: WorkflowType, launchConfig?: WorkflowLaunchConfig | null) {
+  const fallback = QUALITY_BUDGETS[workflowType] ?? { minMs: 2 * 60 * 1000, minMarkdownChars: 1500, label: workflowType };
+  return {
+    label: fallback.label,
+    minMs: launchConfig?.minRuntimeMinutes ? Math.max(1, Math.trunc(launchConfig.minRuntimeMinutes)) * 60 * 1000 : fallback.minMs,
+    minMarkdownChars: launchConfig?.minMarkdownChars ? Math.max(1, Math.trunc(launchConfig.minMarkdownChars)) : fallback.minMarkdownChars
+  };
 }
 
 function countChangedMarkdownChars(repoPath: string, changedSince: Date) {
@@ -968,11 +1446,7 @@ function summarizeArtifact(repoPath: string, artifactPath: string, changedSince:
 }
 
 function hasCoreArtifact(repoPath: string, changedSince?: Date) {
-  return CORE_ARTIFACTS.some((artifactPath) => {
-    const fullPath = path.join(repoPath, artifactPath);
-    if (!existsSync(fullPath)) return false;
-    return changedSince ? statMtime(fullPath) >= changedSince : true;
-  });
+  return hasRecoverableArtifact(repoPath, changedSince ?? new Date(0), null);
 }
 
 function statMtime(filePath: string) {
@@ -1035,6 +1509,7 @@ function mapRun(row: any): Run {
     id: row.id,
     projectId: row.project_id,
     workflowTemplateId: row.workflow_template_id,
+    workflowType: row.workflow_type,
     executorId: row.executor_id,
     status: row.status,
     currentNodeId: row.current_node_id,
@@ -1042,7 +1517,13 @@ function mapRun(row: any): Run {
     startedAt: row.started_at,
     endedAt: row.ended_at,
     exitCode: row.exit_code,
-    errorMessage: row.error_message
+    errorMessage: row.error_message,
+    parentRunId: row.parent_run_id,
+    continuationIndex: row.continuation_index ?? 0,
+    continuationReason: row.continuation_reason,
+    launchConfig: parseJson<WorkflowLaunchConfig | null>(row.launch_config_json, null),
+    extraPrompt: row.extra_prompt,
+    promptOverride: row.prompt_override
   };
 }
 

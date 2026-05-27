@@ -6,7 +6,12 @@ import { getDb, id, nowIso, parseJson } from "../db/database";
 import type { ArisDiagnostics, ExecutorConfig, ExecutorTestResult, SaveExecutorInput } from "../../shared/types";
 import { UTF8_PROCESS_ENV } from "./encoding.service";
 
-const BLOCKED_DEFAULT_MODELS = new Set(["", "auto", "default", "gpt-5.4"]);
+const BLOCKED_DEFAULT_MODELS = new Set(["", "auto", "default"]);
+const DEFAULT_CODEX_ENV = {
+  OPENAI_MODEL: "gpt-5.4",
+  OPENAI_FALLBACK_MODELS: "gpt-5.5,gpt-5.4-mini,gpt-5.3-codex,gpt-5.2",
+  CODEX_REASONING_EFFORT: "high"
+};
 const ARIS_SKILL_NAMES = [
   "idea-discovery",
   "research-pipeline",
@@ -25,19 +30,25 @@ export function ensureDefaultExecutors() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   [
-    ["executor-codex", "Codex CLI", "codex-cli", "codex", []],
+    ["executor-codex", "Codex CLI", "codex-cli", process.platform === "win32" ? "codex.cmd" : "codex", []],
     ["executor-aris", "ARIS-Code CLI", "aris-code", "aris", ["--help"]],
     ["executor-claude", "Claude Code", "claude-code", "claude", []],
     ["executor-custom", "Custom command", "custom", "cmd.exe", ["/c", "echo 请配置自定义执行器"]]
   ].forEach(([eid, name, kind, executable, args]) => {
-    insert.run(eid, name, kind, executable, JSON.stringify(args), null, JSON.stringify({}), kind === "codex-cli" ? 1 : 0, stamp, stamp);
+    insert.run(eid, name, kind, executable, JSON.stringify(args), null, JSON.stringify(kind === "codex-cli" ? DEFAULT_CODEX_ENV : {}), kind === "codex-cli" ? 1 : 0, stamp, stamp);
   });
   if (count.count > 0) {
     db.prepare(
       "UPDATE executor_configs SET enabled = 1, default_args_json = CASE WHEN default_args_json = '[\"--version\"]' THEN '[]' ELSE default_args_json END, updated_at = ? WHERE id = 'executor-codex'"
     ).run(stamp);
+    if (process.platform === "win32") {
+      db.prepare(
+        "UPDATE executor_configs SET executable_path = 'codex.cmd', updated_at = ? WHERE id = 'executor-codex' AND lower(executable_path) IN ('codex', 'codex.ps1')"
+      ).run(stamp);
+    }
   }
   sanitizePersistedCodexExecutors(db, stamp);
+  ensureCodexEnvDefaults(db, stamp);
 }
 
 export function listExecutors(): ExecutorConfig[] {
@@ -132,7 +143,7 @@ export async function diagnoseAris(): Promise<ArisDiagnostics> {
       error: error instanceof Error ? error.message : String(error)
     })),
     detectCommand(["aris", "aris.exe"]),
-    detectCommand(["codex", "codex.cmd", "codex.exe"]),
+    detectCommand(["codex.cmd", "codex.exe", "codex"]),
     detectCommand(["claude", "claude.cmd", "claude.exe"])
   ]);
   const skills = detectArisSkills();
@@ -256,6 +267,25 @@ function mapExecutor(row: any): ExecutorConfig {
   };
 }
 
+export function normalizeCodexExecutablePath(executablePath: string) {
+  const candidate = executablePath.trim() || "codex";
+  if (process.platform !== "win32") return candidate;
+
+  const basename = path.basename(candidate).toLowerCase();
+  if (basename === "codex.cmd" || basename === "codex.exe") return candidate;
+  if (basename === "codex.ps1") {
+    const cmdPath = path.join(path.dirname(candidate), "codex.cmd");
+    return existsSync(cmdPath) ? cmdPath : "codex.cmd";
+  }
+  if (basename === "codex") {
+    const exePath = path.join(path.dirname(candidate), "codex.exe");
+    if (path.dirname(candidate) !== "." && existsSync(exePath)) return exePath;
+    const cmdPath = path.dirname(candidate) === "." ? "codex.cmd" : path.join(path.dirname(candidate), "codex.cmd");
+    return cmdPath === "codex.cmd" || existsSync(cmdPath) ? cmdPath : "codex.cmd";
+  }
+  return candidate;
+}
+
 function sanitizePersistedCodexExecutors(db: ReturnType<typeof getDb>, stamp: string) {
   const rows = db.prepare("SELECT id, default_args_json, env_json FROM executor_configs WHERE kind = 'codex-cli'").all() as any[];
   const update = db.prepare("UPDATE executor_configs SET default_args_json = ?, env_json = ?, updated_at = ? WHERE id = ?");
@@ -268,6 +298,23 @@ function sanitizePersistedCodexExecutors(db: ReturnType<typeof getDb>, stamp: st
     const nextEnvJson = JSON.stringify(nextEnv);
     if (nextArgsJson !== row.default_args_json || nextEnvJson !== (row.env_json ?? "{}")) {
       update.run(nextArgsJson, nextEnvJson, stamp, row.id);
+    }
+  }
+}
+
+function ensureCodexEnvDefaults(db: ReturnType<typeof getDb>, stamp: string) {
+  const rows = db.prepare("SELECT id, env_json FROM executor_configs WHERE kind = 'codex-cli'").all() as any[];
+  const update = db.prepare("UPDATE executor_configs SET env_json = ?, updated_at = ? WHERE id = ?");
+  for (const row of rows) {
+    const env = parseJson<Record<string, string>>(row.env_json, {});
+    const next = {
+      ...env,
+      OPENAI_MODEL: env.OPENAI_MODEL?.trim() ? env.OPENAI_MODEL : DEFAULT_CODEX_ENV.OPENAI_MODEL,
+      OPENAI_FALLBACK_MODELS: env.OPENAI_FALLBACK_MODELS?.trim() ? env.OPENAI_FALLBACK_MODELS : DEFAULT_CODEX_ENV.OPENAI_FALLBACK_MODELS,
+      CODEX_REASONING_EFFORT: env.CODEX_REASONING_EFFORT?.trim() ? env.CODEX_REASONING_EFFORT : DEFAULT_CODEX_ENV.CODEX_REASONING_EFFORT
+    };
+    if (JSON.stringify(next) !== (row.env_json ?? "{}")) {
+      update.run(JSON.stringify(next), stamp, row.id);
     }
   }
 }
@@ -287,11 +334,11 @@ function sanitizeCodexDefaultArgs(args: string[]) {
     const arg = args[index];
     const lower = arg.toLowerCase();
     const value = args[index + 1]?.toLowerCase();
-    if ((lower === "-m" || lower === "--model") && value === "gpt-5.4") {
+    if ((lower === "-m" || lower === "--model") && (value === "auto" || value === "default")) {
       index += 1;
       continue;
     }
-    if (lower === "--model=gpt-5.4") continue;
+    if (lower === "--model=auto" || lower === "--model=default") continue;
     next.push(arg);
   }
   return next;
