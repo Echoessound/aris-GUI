@@ -182,6 +182,19 @@ export function SettingsPage() {
                 <AutoContinueSettingsPanel title="全局自动续接" />
               </div>
             )
+          },
+          {
+            key: "about",
+            label: "关于",
+            children: (
+              <div className="panel">
+                <Space direction="vertical" size="middle">
+                  <Typography.Title level={5} style={{ margin: 0 }}>关于 ARIS Paper Studio</Typography.Title>
+                  <Typography.Text>由 JLU 的 echosound 开发。</Typography.Text>
+                  <Typography.Text className="mono">版本号：0.1.0</Typography.Text>
+                </Space>
+              </div>
+            )
           }
         ]}
       />

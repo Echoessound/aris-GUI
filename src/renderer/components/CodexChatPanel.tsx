@@ -10,10 +10,19 @@ interface CodexChatPanelProps {
   selectedRunId?: string;
 }
 
+const chatModelOptions = [
+  { value: "gpt-5.5", label: "gpt-5.5" },
+  { value: "gpt-5.4", label: "gpt-5.4" },
+  { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
+  { value: "gpt-5.3-codex", label: "gpt-5.3-codex" },
+  { value: "gpt-5.2", label: "gpt-5.2" }
+];
+
 export function CodexChatPanel({ projectId, runs, selectedRunId }: CodexChatPanelProps) {
   const [messages, setMessages] = useState<CodexChatMessage[]>([]);
   const [chainMessageIds, setChainMessageIds] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<CodexChatMode>("ask");
+  const [selectedModel, setSelectedModel] = useState("gpt-5.4");
   const [scopeRunId, setScopeRunId] = useState<string | null>(selectedRunId ?? null);
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -75,7 +84,8 @@ export function CodexChatPanel({ projectId, runs, selectedRunId }: CodexChatPane
         runId: scopeRunId,
         message: trimmed,
         mode: nextMode,
-        intent: intent ?? defaultIntent(nextMode, scopeRunId)
+        intent: intent ?? defaultIntent(nextMode, scopeRunId),
+        model: selectedModel
       });
       if (!overrideText) setText("");
       await load();
@@ -146,6 +156,13 @@ export function CodexChatPanel({ projectId, runs, selectedRunId }: CodexChatPane
               { value: "project", label: "整个项目" },
               ...runs.map((run) => ({ value: run.id, label: `第 ${run.roundIndex} 轮 - ${run.status}` }))
             ]}
+          />
+          <Select
+            value={selectedModel}
+            style={{ width: 180 }}
+            disabled={hasRunningMessage}
+            options={chatModelOptions}
+            onChange={setSelectedModel}
           />
         </Space>
         <Typography.Text className="muted">
